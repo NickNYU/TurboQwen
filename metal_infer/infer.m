@@ -1,14 +1,14 @@
 /*
- * infer.m — Complete Qwen3.5-397B inference engine using Metal
+ * infer.m — Complete Qwen3.5-35B inference engine using Metal
  *
- * Full forward pass: embedding -> 60 transformer layers -> norm -> lm_head -> sample
+ * Full forward pass: embedding -> 40 transformer layers -> norm -> lm_head -> sample
  * Non-expert weights loaded from model_weights.bin (mmap'd at startup)
  * Expert weights loaded from packed_experts/ per layer per token (pread)
  *
- * Architecture: Qwen3.5-397B-A17B (MoE)
- *   - 60 layers: 45 linear attention (GatedDeltaNet) + 15 full attention
- *   - hidden_size=4096, head_dim=256, num_attention_heads=32, num_kv_heads=2
- *   - 512 experts/layer, 10 active (we use K=4 for speed)
+ * Architecture: Qwen3.5-35B-A3B (MoE)
+ *   - 40 layers: 30 linear attention (GatedDeltaNet) + 10 full attention
+ *   - hidden_size=2048, head_dim=256, num_attention_heads=16, num_kv_heads=2
+ *   - 256 experts/layer, 8 active (we use K=4 for speed)
  *   - Shared expert per layer (always active)
  *   - Linear attention: conv1d(kernel=4) + gated delta recurrence
  *   - Full attention: standard QKV + scaled dot product + RoPE
@@ -69,29 +69,29 @@
 // Model constants
 // ============================================================================
 
-#define HIDDEN_DIM          4096
-#define NUM_LAYERS          60
-#define NUM_ATTN_HEADS      32
+#define HIDDEN_DIM          2048
+#define NUM_LAYERS          40
+#define NUM_ATTN_HEADS      16
 #define NUM_KV_HEADS        2
 #define HEAD_DIM            256
 #define VOCAB_SIZE          248320
 #define RMS_NORM_EPS        1e-6f
-#define NUM_EXPERTS         512
-#define NUM_EXPERTS_PER_TOK 10
-#define MOE_INTERMEDIATE    1024
-#define SHARED_INTERMEDIATE 1024
+#define NUM_EXPERTS         256
+#define NUM_EXPERTS_PER_TOK 8
+#define MOE_INTERMEDIATE    512
+#define SHARED_INTERMEDIATE 512
 #define FULL_ATTN_INTERVAL  4
 #define GROUP_SIZE          64
 #define BITS                4
 
 // Linear attention (GatedDeltaNet) constants
-#define LINEAR_NUM_V_HEADS  64
+#define LINEAR_NUM_V_HEADS  32
 #define LINEAR_NUM_K_HEADS  16
 #define LINEAR_KEY_DIM      128   // head_k_dim
 #define LINEAR_VALUE_DIM    128   // head_v_dim
 #define LINEAR_TOTAL_KEY    (LINEAR_NUM_K_HEADS * LINEAR_KEY_DIM)   // 2048
-#define LINEAR_TOTAL_VALUE  (LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM) // 8192
-#define LINEAR_CONV_DIM     (LINEAR_TOTAL_KEY * 2 + LINEAR_TOTAL_VALUE) // 12288
+#define LINEAR_TOTAL_VALUE  (LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM) // 4096
+#define LINEAR_CONV_DIM     (LINEAR_TOTAL_KEY * 2 + LINEAR_TOTAL_VALUE) // 8192
 #define CONV_KERNEL_SIZE    4
 
 // Full attention constants
@@ -100,23 +100,28 @@
 #define ROTARY_DIM          (int)(HEAD_DIM * PARTIAL_ROTARY)  // 64
 
 // Expert packed binary layout (from existing code)
-#define EXPERT_SIZE         7077888
+#define EXPERT_SIZE         1769472
 
 // 2-bit expert layout (from repack_experts_2bit.py)
-#define EXPERT_SIZE_2BIT    3932160
+// Recalculated for 35B: moe_intermediate=512, hidden=2048
+#define EXPERT_SIZE_2BIT    983040
 #define GATE_W_OFF_2  0
-#define GATE_S_OFF_2  1048576
-#define GATE_B_OFF_2  1179648
-#define UP_W_OFF_2    1310720
-#define UP_S_OFF_2    2359296
-#define UP_B_OFF_2    2490368
-#define DOWN_W_OFF_2  2621440
-#define DOWN_S_OFF_2  3670016
-#define DOWN_B_OFF_2  3801088
+#define GATE_S_OFF_2  262144
+#define GATE_B_OFF_2  294912
+#define UP_W_OFF_2    327680
+#define UP_S_OFF_2    589824
+#define UP_B_OFF_2    622592
+#define DOWN_W_OFF_2  655360
+#define DOWN_S_OFF_2  917504
+#define DOWN_B_OFF_2  950272
 
 // KV cache maximum context length
 #define MAX_SEQ_LEN 1048576  // 1M context — only 15 full-attn layers need KV cache, ~15GB at max
 #define GPU_KV_SEQ  8192     // GPU KV buffer pre-allocation (grows if exceeded, falls back to CPU attn)
+
+// QJL (Quantized Johnson-Lindenstrauss) 1-bit KV cache compression
+// Projects K vectors through random ±1 matrix, stores sign bits only (32x compression)
+#define QJL_PACKED_PER_HEAD 8  // HEAD_DIM(256) bits / 32 bits per uint32 = 8 uint32s per head
 
 // Special tokens
 #define EOS_TOKEN_1         248046
@@ -124,7 +129,7 @@
 #define THINK_START_TOKEN   248068  // <think>
 #define THINK_END_TOKEN     248069  // </think>
 
-#define MODEL_PATH_DEFAULT "/Users/danielwoods/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
+#define MODEL_PATH_DEFAULT "./model"
 
 // ============================================================================
 // Timing helper
@@ -170,7 +175,7 @@ static uint64_t g_pred_misses = 0;
 static uint64_t g_pred_layers = 0;
 
 // Routing data collection for training an expert predictor
-// Binary format per sample: int32 layer_idx, int32 K, float32[4096] hidden, int32[K] expert_indices
+// Binary format per sample: int32 layer_idx, int32 K, float32[2048] hidden, int32[K] expert_indices
 static FILE *g_routing_log = NULL;
 static int g_routing_log_samples = 0;
 
@@ -193,6 +198,7 @@ static int g_use_lz4 = 0;                        // auto-detected from packed_ex
 static int g_expert_freq[NUM_LAYERS][NUM_EXPERTS];  // activation count per (layer, expert)
 static int g_freq_tracking = 0;  // enabled by --freq flag
 static int g_use_2bit = 0;       // enabled by --2bit flag: use packed_experts_2bit/ + 2-bit kernel
+static int g_use_qjl = 0;        // enabled by --qjl flag: QJL 1-bit KV cache compression
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
 
@@ -915,6 +921,7 @@ typedef struct {
     id<MTLComputePipelineState> attn_softmax_pipe;
     id<MTLComputePipelineState> attn_values_pipe;
     id<MTLComputePipelineState> sigmoid_gate_pipe;
+    id<MTLComputePipelineState> qjl_attn_scores_pipe;  // QJL 1-bit attention scores
     // Reusable buffers for attention matmuls
     id<MTLBuffer> buf_input;     // input vector [HIDDEN_DIM or max projection input]
     id<MTLBuffer> buf_output;    // output vector [max projection output]
@@ -953,13 +960,16 @@ typedef struct {
     id<MTLBuffer> buf_h_mid;        // [HIDDEN_DIM floats] residual+oproj result
     id<MTLBuffer> buf_sum_sq;       // [1 float] for RMS norm reduction
     // GPU attention buffers (for full attention layers)
-    #define NUM_FULL_ATTN_LAYERS 15
+    #define NUM_FULL_ATTN_LAYERS 10
     id<MTLBuffer> buf_kv_k[NUM_FULL_ATTN_LAYERS];  // K cache per full-attn layer
     id<MTLBuffer> buf_kv_v[NUM_FULL_ATTN_LAYERS];  // V cache per full-attn layer
     id<MTLBuffer> buf_attn_q;       // [NUM_ATTN_HEADS * HEAD_DIM floats] all query heads
     id<MTLBuffer> buf_attn_scores;  // [NUM_ATTN_HEADS * MAX_SEQ_LEN floats] all heads' scores
     id<MTLBuffer> buf_attn_out;     // [NUM_ATTN_HEADS * HEAD_DIM floats] full attention output
     id<MTLBuffer> buf_attn_gate;    // [NUM_ATTN_HEADS * HEAD_DIM floats] sigmoid gate
+    // QJL 1-bit KV cache buffers (compressed K cache for full attention layers)
+    id<MTLBuffer> buf_qjl_k[NUM_FULL_ATTN_LAYERS];   // packed K: [GPU_KV_SEQ * NUM_KV_HEADS * QJL_PACKED_PER_HEAD uint32s]
+    id<MTLBuffer> buf_qjl_packed_q;                    // packed Q: [NUM_ATTN_HEADS * QJL_PACKED_PER_HEAD uint32s]
     // CMD3 GPU-side combine buffers (weighted_sum + residual + norm on GPU)
     id<MTLComputePipelineState> moe_combine_residual;  // fused combine kernel
     id<MTLBuffer> buf_moe_hidden;     // [HIDDEN_DIM floats] GPU combine output (hidden state)
@@ -975,7 +985,7 @@ typedef struct {
     id<MTLComputePipelineState> compute_decay_beta; // g_decay and beta_gate for delta-net
     id<MTLComputePipelineState> gated_rms_norm;  // z-gated output normalization
     // Persistent GPU state buffers for linear attention layers
-    #define NUM_LINEAR_LAYERS 45
+    #define NUM_LINEAR_LAYERS 30
     id<MTLBuffer> buf_delta_state[NUM_LINEAR_LAYERS];   // [64*128*128] float per layer
     id<MTLBuffer> buf_conv_state[NUM_LINEAR_LAYERS];     // [3*12288] float per layer
     // Scratch buffers for delta-net inputs/outputs
@@ -990,6 +1000,44 @@ typedef struct {
 } MetalCtx;
 
 static MetalCtx *g_metal = NULL;
+
+// ============================================================================
+// QJL projection matrices (initialized once, used for all full-attention layers)
+// ============================================================================
+
+static float *g_qjl_R[10];  // [HEAD_DIM * HEAD_DIM] random ±1 projection per full-attn layer
+
+static void qjl_init_projections(void) {
+    for (int i = 0; i < 10; i++) {
+        g_qjl_R[i] = malloc(HEAD_DIM * HEAD_DIM * sizeof(float));
+        // Deterministic xorshift32 PRNG per layer for reproducibility
+        uint32_t seed = 0xDEAD0000 + (uint32_t)i;
+        for (int j = 0; j < HEAD_DIM * HEAD_DIM; j++) {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            g_qjl_R[i][j] = (seed & 1) ? 1.0f : -1.0f;
+        }
+    }
+    printf("[qjl] Initialized %d projection matrices (%.1f MB)\n",
+           10, (double)(10 * HEAD_DIM * HEAD_DIM * sizeof(float)) / 1e6);
+}
+
+// QJL encode: project key through R matrix, pack sign bits into uint32s
+// k: [HEAD_DIM], R: [HEAD_DIM x HEAD_DIM], packed: [QJL_PACKED_PER_HEAD]
+static void qjl_encode_key(const float *k, const float *R, uint32_t *packed) {
+    memset(packed, 0, QJL_PACKED_PER_HEAD * sizeof(uint32_t));
+    for (int i = 0; i < HEAD_DIM; i++) {
+        const float *Ri = R + i * HEAD_DIM;
+        float dot = 0.0f;
+        for (int d = 0; d < HEAD_DIM; d++) {
+            dot += Ri[d] * k[d];  // R entries are ±1
+        }
+        if (dot >= 0.0f) {
+            packed[i >> 5] |= (1u << (i & 31));
+        }
+    }
+}
 
 static MetalCtx *metal_setup(void) {
     MetalCtx *ctx = calloc(1, sizeof(MetalCtx));
@@ -1054,6 +1102,7 @@ static MetalCtx *metal_setup(void) {
     ctx->attn_softmax_pipe = makePipe(@"attn_softmax_batched");
     ctx->attn_values_pipe  = makePipe(@"attn_values_batched");
     ctx->sigmoid_gate_pipe = makePipe(@"sigmoid_gate");
+    ctx->qjl_attn_scores_pipe = makePipe(@"qjl_attn_scores_batched");
     ctx->moe_combine_residual = makePipe(@"moe_combine_residual");
     ctx->delta_net_step    = makePipe(@"gated_delta_net_step");
     ctx->conv1d_step       = makePipe(@"conv1d_step");
@@ -1073,8 +1122,8 @@ static MetalCtx *metal_setup(void) {
     }
 
     // Allocate reusable buffers (large enough for biggest projection)
-    // Q proj output is 16384 floats, lm_head output is 248320 floats
-    // o_proj input is 8192, linear attn out_proj input is 8192
+    // Q proj output is 8192 floats, lm_head output is 248320 floats
+    // o_proj input is 4096, linear attn out_proj input is 4096
     size_t max_out = VOCAB_SIZE * sizeof(float);  // lm_head is largest
     size_t max_in = LINEAR_TOTAL_VALUE * sizeof(float);  // 8192 floats (linear_attn out_proj)
     if (max_in < (size_t)(NUM_ATTN_HEADS * HEAD_DIM) * sizeof(float)) {
@@ -1188,31 +1237,46 @@ static MetalCtx *metal_setup(void) {
         printf("[metal] GPU attention buffers: %d KV caches (%.1f MB each), scores buf %.1f MB\n",
                NUM_FULL_ATTN_LAYERS, kv_cache_size / 1e6,
                (double)(NUM_ATTN_HEADS * MAX_SEQ_LEN * sizeof(float)) / 1e6);
+
+        // QJL 1-bit compressed K cache buffers (conditionally allocated)
+        if (g_use_qjl) {
+            size_t qjl_kv_size = GPU_KV_SEQ * NUM_KV_HEADS * QJL_PACKED_PER_HEAD * sizeof(uint32_t);
+            for (int i = 0; i < NUM_FULL_ATTN_LAYERS; i++) {
+                ctx->buf_qjl_k[i] = [ctx->device newBufferWithLength:qjl_kv_size
+                                                             options:MTLResourceStorageModeShared];
+            }
+            ctx->buf_qjl_packed_q = [ctx->device newBufferWithLength:
+                                     NUM_ATTN_HEADS * QJL_PACKED_PER_HEAD * sizeof(uint32_t)
+                                                             options:MTLResourceStorageModeShared];
+            printf("[metal] QJL buffers: %d layers x %.1f KB K-cache + %.0f B packed Q\n",
+                   NUM_FULL_ATTN_LAYERS, qjl_kv_size / 1024.0,
+                   (double)(NUM_ATTN_HEADS * QJL_PACKED_PER_HEAD * sizeof(uint32_t)));
+        }
     }
 
     // Persistent GPU state buffers for delta-net (linear attention layers)
     if (ctx->delta_net_step) {
         for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
-            ctx->buf_delta_state[i] = [ctx->device newBufferWithLength:64*128*128*sizeof(float)
+            ctx->buf_delta_state[i] = [ctx->device newBufferWithLength:32*128*128*sizeof(float)
                                                                options:MTLResourceStorageModeShared];
-            memset([ctx->buf_delta_state[i] contents], 0, 64*128*128*sizeof(float));
-            ctx->buf_conv_state[i] = [ctx->device newBufferWithLength:3*12288*sizeof(float)
+            memset([ctx->buf_delta_state[i] contents], 0, 32*128*128*sizeof(float));
+            ctx->buf_conv_state[i] = [ctx->device newBufferWithLength:3*8192*sizeof(float)
                                                               options:MTLResourceStorageModeShared];
-            memset([ctx->buf_conv_state[i] contents], 0, 3*12288*sizeof(float));
+            memset([ctx->buf_conv_state[i] contents], 0, 3*8192*sizeof(float));
         }
         // Scratch buffers for delta-net inputs/outputs (allocated once, reused)
         ctx->buf_delta_q       = [ctx->device newBufferWithLength:2048*sizeof(float)  options:MTLResourceStorageModeShared];
         ctx->buf_delta_k       = [ctx->device newBufferWithLength:2048*sizeof(float)  options:MTLResourceStorageModeShared];
-        ctx->buf_delta_v       = [ctx->device newBufferWithLength:8192*sizeof(float)  options:MTLResourceStorageModeShared];
-        ctx->buf_delta_g_decay = [ctx->device newBufferWithLength:64*sizeof(float)    options:MTLResourceStorageModeShared];
-        ctx->buf_delta_beta    = [ctx->device newBufferWithLength:64*sizeof(float)    options:MTLResourceStorageModeShared];
-        ctx->buf_delta_output  = [ctx->device newBufferWithLength:8192*sizeof(float)  options:MTLResourceStorageModeShared];
-        ctx->buf_conv_input    = [ctx->device newBufferWithLength:12288*sizeof(float) options:MTLResourceStorageModeShared];
-        ctx->buf_conv_output   = [ctx->device newBufferWithLength:12288*sizeof(float) options:MTLResourceStorageModeShared];
+        ctx->buf_delta_v       = [ctx->device newBufferWithLength:4096*sizeof(float)  options:MTLResourceStorageModeShared];
+        ctx->buf_delta_g_decay = [ctx->device newBufferWithLength:32*sizeof(float)    options:MTLResourceStorageModeShared];
+        ctx->buf_delta_beta    = [ctx->device newBufferWithLength:32*sizeof(float)    options:MTLResourceStorageModeShared];
+        ctx->buf_delta_output  = [ctx->device newBufferWithLength:4096*sizeof(float)  options:MTLResourceStorageModeShared];
+        ctx->buf_conv_input    = [ctx->device newBufferWithLength:8192*sizeof(float) options:MTLResourceStorageModeShared];
+        ctx->buf_conv_output   = [ctx->device newBufferWithLength:8192*sizeof(float) options:MTLResourceStorageModeShared];
         printf("[metal] Delta-net GPU buffers: %d layers (%.1f MB state + %.1f MB scratch)\n",
                NUM_LINEAR_LAYERS,
-               NUM_LINEAR_LAYERS * (64*128*128*4 + 3*12288*4) / 1e6,
-               (2048+2048+8192+64+64+8192+12288+12288) * 4 / 1e6);
+               NUM_LINEAR_LAYERS * (32*128*128*4 + 3*8192*4) / 1e6,
+               (2048+2048+4096+32+32+4096+8192+8192) * 4 / 1e6);
     }
 
     // Create shared event for CPU-GPU async pipeline
@@ -1228,9 +1292,9 @@ static void reset_delta_net_state(void) {
     if (!g_metal || !g_metal->delta_net_step) return;
     for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
         if (g_metal->buf_delta_state[i])
-            memset([g_metal->buf_delta_state[i] contents], 0, 64*128*128*sizeof(float));
+            memset([g_metal->buf_delta_state[i] contents], 0, 32*128*128*sizeof(float));
         if (g_metal->buf_conv_state[i])
-            memset([g_metal->buf_conv_state[i] contents], 0, 3*12288*sizeof(float));
+            memset([g_metal->buf_conv_state[i] contents], 0, 3*8192*sizeof(float));
     }
 }
 
@@ -1512,9 +1576,9 @@ static void gpu_encode_expert_forward_slot(
         up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
         down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
     } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
-        up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
-        down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
+        gate_w_off = 0;        gate_s_off = 524288;   gate_b_off = 557056;
+        up_w_off   = 589824;   up_s_off   = 1114112;  up_b_off   = 1146880;
+        down_w_off = 1179648;  down_s_off = 1703936;  down_b_off = 1736704;
     }
     id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
@@ -1608,9 +1672,9 @@ static void gpu_encode_expert_forward_slot_buf(
         up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
         down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
     } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
-        up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
-        down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
+        gate_w_off = 0;        gate_s_off = 524288;   gate_b_off = 557056;
+        up_w_off   = 589824;   up_s_off   = 1114112;  up_b_off   = 1146880;
+        down_w_off = 1179648;  down_s_off = 1703936;  down_b_off = 1736704;
     }
     id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
@@ -1708,9 +1772,9 @@ static void gpu_encode_experts_batched(
         up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
         down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
     } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
-        up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
-        down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
+        gate_w_off = 0;        gate_s_off = 524288;   gate_b_off = 557056;
+        up_w_off   = 589824;   up_s_off   = 1114112;  up_b_off   = 1146880;
+        down_w_off = 1179648;  down_s_off = 1703936;  down_b_off = 1736704;
     }
     id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
@@ -1794,14 +1858,14 @@ static void gpu_encode_expert_forward(
     id<MTLCommandBuffer> cmdbuf
 ) {
     NSUInteger gate_w_off = 0;
-    NSUInteger gate_s_off = 2097152;
-    NSUInteger gate_b_off = 2228224;
-    NSUInteger up_w_off   = 2359296;
-    NSUInteger up_s_off   = 4456448;
-    NSUInteger up_b_off   = 4587520;
-    NSUInteger down_w_off = 4718592;
-    NSUInteger down_s_off = 6815744;
-    NSUInteger down_b_off = 6946816;
+    NSUInteger gate_s_off = 524288;
+    NSUInteger gate_b_off = 557056;
+    NSUInteger up_w_off   = 589824;
+    NSUInteger up_s_off   = 1114112;
+    NSUInteger up_b_off   = 1146880;
+    NSUInteger down_w_off = 1179648;
+    NSUInteger down_s_off = 1703936;
+    NSUInteger down_b_off = 1736704;
 
     uint32_t gate_up_out = MOE_INTERMEDIATE;
     uint32_t gate_up_in  = HIDDEN_DIM;
@@ -1917,9 +1981,9 @@ static void gpu_expert_forward(
         up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
         down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
     } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
-        up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
-        down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
+        gate_w_off = 0;        gate_s_off = 524288;   gate_b_off = 557056;
+        up_w_off   = 589824;   up_s_off   = 1114112;  up_b_off   = 1146880;
+        down_w_off = 1179648;  down_s_off = 1703936;  down_b_off = 1736704;
     }
     id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
@@ -2065,6 +2129,7 @@ static void apply_rotary_emb(float *q, float *k, int pos, int num_heads, int num
 typedef struct {
     float *k_cache;  // [max_seq, num_kv_heads * head_dim]
     float *v_cache;  // [max_seq, num_kv_heads * head_dim]
+    uint32_t *qjl_k_cache;  // [max_seq, num_kv_heads * QJL_PACKED_PER_HEAD] (QJL mode only)
     int len;         // current number of cached entries
 } KVCache;
 
@@ -2072,6 +2137,9 @@ static KVCache *kv_cache_new(void) {
     KVCache *c = calloc(1, sizeof(KVCache));
     c->k_cache = calloc(MAX_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM, sizeof(float));
     c->v_cache = calloc(MAX_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM, sizeof(float));
+    if (g_use_qjl) {
+        c->qjl_k_cache = calloc((size_t)MAX_SEQ_LEN * NUM_KV_HEADS * QJL_PACKED_PER_HEAD, sizeof(uint32_t));
+    }
     c->len = 0;
     return c;
 }
@@ -2080,6 +2148,7 @@ static void kv_cache_free(KVCache *c) {
     if (c) {
         free(c->k_cache);
         free(c->v_cache);
+        free(c->qjl_k_cache);
         free(c);
     }
 }
@@ -2155,8 +2224,8 @@ static void full_attention_forward(
     // ---- QKV Projection ----
     // CRITICAL: Q projection outputs num_heads * head_dim * 2 = 16384
     // The second half is a sigmoid gate applied after attention
-    int q_proj_dim = NUM_ATTN_HEADS * HEAD_DIM * 2;  // 32 * 256 * 2 = 16384
-    int q_dim = NUM_ATTN_HEADS * HEAD_DIM;            // 32 * 256 = 8192
+    int q_proj_dim = NUM_ATTN_HEADS * HEAD_DIM * 2;  // 16 * 256 * 2 = 8192
+    int q_dim = NUM_ATTN_HEADS * HEAD_DIM;            // 16 * 256 = 4096
     int kv_dim = NUM_KV_HEADS * HEAD_DIM;             // 2 * 256 = 512
 
     float *q_proj_out = calloc(q_proj_dim, sizeof(float));
@@ -2756,14 +2825,14 @@ static void moe_forward(
                 }
 
                 uint32_t *gw = (uint32_t *)expert_data;
-                uint16_t *gs_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_S_OFF_2 : 2097152));
-                uint16_t *gb_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_B_OFF_2 : 2228224));
-                uint32_t *uw = (uint32_t *)((char *)expert_data + (g_use_2bit ? UP_W_OFF_2 : 2359296));
-                uint16_t *us_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_S_OFF_2 : 4456448));
-                uint16_t *ub_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_B_OFF_2 : 4587520));
-                uint32_t *dw = (uint32_t *)((char *)expert_data + (g_use_2bit ? DOWN_W_OFF_2 : 4718592));
-                uint16_t *ds_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_S_OFF_2 : 6815744));
-                uint16_t *db_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_B_OFF_2 : 6946816));
+                uint16_t *gs_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_S_OFF_2 : 524288));
+                uint16_t *gb_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_B_OFF_2 : 557056));
+                uint32_t *uw = (uint32_t *)((char *)expert_data + (g_use_2bit ? UP_W_OFF_2 : 589824));
+                uint16_t *us_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_S_OFF_2 : 1114112));
+                uint16_t *ub_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_B_OFF_2 : 1146880));
+                uint32_t *dw = (uint32_t *)((char *)expert_data + (g_use_2bit ? DOWN_W_OFF_2 : 1179648));
+                uint16_t *ds_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_S_OFF_2 : 1703936));
+                uint16_t *db_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_B_OFF_2 : 1736704));
 
                 float *gate_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
                 float *up_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
@@ -4521,7 +4590,25 @@ static void fused_layer_forward(
         memcpy(kv->k_cache + cache_pos * kv_dim, k_out, kv_dim * sizeof(float));
         memcpy(kv->v_cache + cache_pos * kv_dim, v_out, kv_dim * sizeof(float));
 
+        // QJL: encode K into packed sign projections
         int fa_idx = (layer_idx + 1) / FULL_ATTN_INTERVAL - 1;
+        if (g_use_qjl && fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS) {
+            float *R = g_qjl_R[fa_idx];
+            for (int kv_h = 0; kv_h < NUM_KV_HEADS; kv_h++) {
+                uint32_t packed[QJL_PACKED_PER_HEAD];
+                qjl_encode_key(k_out + kv_h * HEAD_DIM, R, packed);
+                // Write to CPU QJL cache
+                size_t qjl_off = (size_t)cache_pos * NUM_KV_HEADS * QJL_PACKED_PER_HEAD
+                                 + kv_h * QJL_PACKED_PER_HEAD;
+                memcpy(kv->qjl_k_cache + qjl_off, packed, QJL_PACKED_PER_HEAD * sizeof(uint32_t));
+                // Write to GPU QJL buffer
+                if (g_metal && g_metal->buf_qjl_k[fa_idx]) {
+                    memcpy((uint32_t *)[g_metal->buf_qjl_k[fa_idx] contents] + qjl_off,
+                           packed, QJL_PACKED_PER_HEAD * sizeof(uint32_t));
+                }
+            }
+        }
+
         if (g_metal && g_metal->attn_scores_pipe && fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS) {
             memcpy((float *)[g_metal->buf_kv_k[fa_idx] contents] + cache_pos * kv_dim,
                    k_out, kv_dim * sizeof(float));
@@ -4546,26 +4633,64 @@ static void fused_layer_forward(
             // Copy Q and gate to GPU; attention dispatches will be in CMD2
             memcpy([g_metal->buf_attn_q contents], q, q_dim * sizeof(float));
             memcpy([g_metal->buf_attn_gate contents], q_gate, q_dim * sizeof(float));
+            // QJL: pack Q on CPU, copy packed Q to GPU for QJL kernel
+            if (g_use_qjl && g_metal->buf_qjl_packed_q) {
+                float *R = g_qjl_R[fa_idx];
+                uint32_t *gpu_pq = (uint32_t *)[g_metal->buf_qjl_packed_q contents];
+                for (int h = 0; h < NUM_ATTN_HEADS; h++) {
+                    int kv_h = h / heads_per_kv;
+                    (void)kv_h;  // all Q heads for same KV group use same R
+                    qjl_encode_key(q + h * HEAD_DIM, R, gpu_pq + h * QJL_PACKED_PER_HEAD);
+                }
+            }
             // attn_out_for_oproj will be set to NULL below — CMD2 reads buf_attn_out
         } else {
             // CPU fallback
-            for (int h = 0; h < NUM_ATTN_HEADS; h++) {
-                int kv_h = h / heads_per_kv;
-                float *qh = q + h * HEAD_DIM;
-                float *scores = malloc(kv->len * sizeof(float));
-                for (int p = 0; p < kv->len; p++) {
-                    float *kp = kv->k_cache + p * kv_dim + kv_h * HEAD_DIM;
-                    float dot = 0.0f;
-                    for (int d = 0; d < HEAD_DIM; d++) dot += qh[d] * kp[d];
-                    scores[p] = dot * scale;
+            if (g_use_qjl && kv->qjl_k_cache) {
+                // QJL CPU attention: pack Q once per head, score via XOR+popcount
+                float *R = g_qjl_R[fa_idx];
+                for (int h = 0; h < NUM_ATTN_HEADS; h++) {
+                    int kv_h = h / heads_per_kv;
+                    uint32_t packed_q[QJL_PACKED_PER_HEAD];
+                    qjl_encode_key(q + h * HEAD_DIM, R, packed_q);
+                    float *scores = malloc(kv->len * sizeof(float));
+                    for (int p = 0; p < kv->len; p++) {
+                        size_t qjl_off = (size_t)p * NUM_KV_HEADS * QJL_PACKED_PER_HEAD
+                                         + kv_h * QJL_PACKED_PER_HEAD;
+                        uint32_t *pk = kv->qjl_k_cache + qjl_off;
+                        int hamming = 0;
+                        for (int i = 0; i < QJL_PACKED_PER_HEAD; i++)
+                            hamming += __builtin_popcount(packed_q[i] ^ pk[i]);
+                        scores[p] = (float)(HEAD_DIM - 2 * hamming) * scale;
+                    }
+                    cpu_softmax(scores, kv->len);
+                    float *oh = attn_out + h * HEAD_DIM;
+                    for (int p = 0; p < kv->len; p++) {
+                        float *vp = kv->v_cache + p * kv_dim + kv_h * HEAD_DIM;
+                        for (int d = 0; d < HEAD_DIM; d++) oh[d] += scores[p] * vp[d];
+                    }
+                    free(scores);
                 }
-                cpu_softmax(scores, kv->len);
-                float *oh = attn_out + h * HEAD_DIM;
-                for (int p = 0; p < kv->len; p++) {
-                    float *vp = kv->v_cache + p * kv_dim + kv_h * HEAD_DIM;
-                    for (int d = 0; d < HEAD_DIM; d++) oh[d] += scores[p] * vp[d];
+            } else {
+                // Float32 CPU attention (original path)
+                for (int h = 0; h < NUM_ATTN_HEADS; h++) {
+                    int kv_h = h / heads_per_kv;
+                    float *qh = q + h * HEAD_DIM;
+                    float *scores = malloc(kv->len * sizeof(float));
+                    for (int p = 0; p < kv->len; p++) {
+                        float *kp = kv->k_cache + p * kv_dim + kv_h * HEAD_DIM;
+                        float dot = 0.0f;
+                        for (int d = 0; d < HEAD_DIM; d++) dot += qh[d] * kp[d];
+                        scores[p] = dot * scale;
+                    }
+                    cpu_softmax(scores, kv->len);
+                    float *oh = attn_out + h * HEAD_DIM;
+                    for (int p = 0; p < kv->len; p++) {
+                        float *vp = kv->v_cache + p * kv_dim + kv_h * HEAD_DIM;
+                        for (int d = 0; d < HEAD_DIM; d++) oh[d] += scores[p] * vp[d];
+                    }
+                    free(scores);
                 }
-                free(scores);
             }
             for (int i = 0; i < q_dim; i++) {
                 float g = 1.0f / (1.0f + expf(-q_gate[i]));
@@ -4827,8 +4952,29 @@ static void fused_layer_forward(
             uint32_t seq_stride = GPU_KV_SEQ;
             uint32_t hpkv = (uint32_t)heads_per_kv;
 
-            // Enc A1: attn_scores_batched
-            {
+            // Enc A1: attn_scores_batched (or QJL variant)
+            if (g_use_qjl && g_metal->qjl_attn_scores_pipe && g_metal->buf_qjl_k[fa_idx]) {
+                // QJL path: XOR + popcount on packed sign projections
+                uint32_t kv_packed_stride = NUM_KV_HEADS * QJL_PACKED_PER_HEAD;
+                uint32_t pph = QJL_PACKED_PER_HEAD;
+                id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->qjl_attn_scores_pipe];
+                [enc setBuffer:g_metal->buf_qjl_packed_q     offset:0 atIndex:0];
+                [enc setBuffer:g_metal->buf_qjl_k[fa_idx]    offset:0 atIndex:1];
+                [enc setBuffer:g_metal->buf_attn_scores       offset:0 atIndex:2];
+                [enc setBytes:&hd              length:4 atIndex:3];
+                [enc setBytes:&kv_packed_stride length:4 atIndex:4];
+                [enc setBytes:&sl              length:4 atIndex:5];
+                [enc setBytes:&seq_stride      length:4 atIndex:6];
+                [enc setBytes:&scale           length:4 atIndex:7];
+                [enc setBytes:&hpkv            length:4 atIndex:8];
+                [enc setBytes:&pph             length:4 atIndex:9];
+                uint32_t total_tgs = sl * NUM_ATTN_HEADS;
+                [enc dispatchThreadgroups:MTLSizeMake(total_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                [enc endEncoding];
+            } else {
+                // Float32 path: full dot-product attention scores
                 id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
                 [enc setComputePipelineState:g_metal->attn_scores_pipe];
                 [enc setBuffer:g_metal->buf_attn_q          offset:0 atIndex:0];
@@ -5479,14 +5625,14 @@ static void fused_layer_forward(
 
             // CPU fallback offsets — use 4-bit layout (2-bit CPU path not yet implemented)
             uint32_t *gw = (uint32_t *)expert_data;
-            uint16_t *gs_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_S_OFF_2 : 2097152));
-            uint16_t *gb_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_B_OFF_2 : 2228224));
-            uint32_t *uw = (uint32_t *)((char *)expert_data + (g_use_2bit ? UP_W_OFF_2 : 2359296));
-            uint16_t *us_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_S_OFF_2 : 4456448));
-            uint16_t *ub_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_B_OFF_2 : 4587520));
-            uint32_t *dw = (uint32_t *)((char *)expert_data + (g_use_2bit ? DOWN_W_OFF_2 : 4718592));
-            uint16_t *ds_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_S_OFF_2 : 6815744));
-            uint16_t *db_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_B_OFF_2 : 6946816));
+            uint16_t *gs_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_S_OFF_2 : 524288));
+            uint16_t *gb_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_B_OFF_2 : 557056));
+            uint32_t *uw = (uint32_t *)((char *)expert_data + (g_use_2bit ? UP_W_OFF_2 : 589824));
+            uint16_t *us_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_S_OFF_2 : 1114112));
+            uint16_t *ub_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_B_OFF_2 : 1146880));
+            uint32_t *dw = (uint32_t *)((char *)expert_data + (g_use_2bit ? DOWN_W_OFF_2 : 1179648));
+            uint16_t *ds_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_S_OFF_2 : 1703936));
+            uint16_t *db_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_B_OFF_2 : 1736704));
 
             float *gate_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
             float *up_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
@@ -6067,6 +6213,7 @@ static void serve_loop(
     typedef struct {
         float *k_snapshot;
         float *v_snapshot;
+        uint32_t *qjl_k_snapshot;  // QJL packed K snapshot (NULL if not using QJL)
         int len;
     } KVSnapshot;
     KVSnapshot kv_snapshots[NUM_LAYERS];
@@ -6090,6 +6237,12 @@ static void serve_loop(
             memcpy(kv_snapshots[i].k_snapshot, kv_caches[i]->k_cache, sz);
             memcpy(kv_snapshots[i].v_snapshot, kv_caches[i]->v_cache, sz);
             kv_snapshots[i].len = kv_caches[i]->len;
+            // QJL snapshot
+            if (g_use_qjl && kv_caches[i]->qjl_k_cache) {
+                size_t qjl_sz = (size_t)sys_pos * NUM_KV_HEADS * QJL_PACKED_PER_HEAD * sizeof(uint32_t);
+                kv_snapshots[i].qjl_k_snapshot = malloc(qjl_sz);
+                memcpy(kv_snapshots[i].qjl_k_snapshot, kv_caches[i]->qjl_k_cache, qjl_sz);
+            }
         }
         if (layer_states[i]) {
             LinearAttnState *s = (LinearAttnState *)layer_states[i];
@@ -6107,12 +6260,12 @@ static void serve_loop(
     if (g_metal && g_metal->delta_net_step) {
         for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
             if (g_metal->buf_delta_state[i]) {
-                size_t sz = 64*128*128*sizeof(float);
+                size_t sz = 32*128*128*sizeof(float);
                 gpu_delta_snapshots[i] = malloc(sz);
                 memcpy(gpu_delta_snapshots[i], [g_metal->buf_delta_state[i] contents], sz);
             }
             if (g_metal->buf_conv_state[i]) {
-                size_t sz = 3*12288*sizeof(float);
+                size_t sz = 3*8192*sizeof(float);
                 gpu_conv_snapshots[i] = malloc(sz);
                 memcpy(gpu_conv_snapshots[i], [g_metal->buf_conv_state[i] contents], sz);
             }
@@ -6253,6 +6406,11 @@ static void serve_loop(
                         memcpy(kv_caches[i]->k_cache, kv_snapshots[i].k_snapshot, sz);
                         memcpy(kv_caches[i]->v_cache, kv_snapshots[i].v_snapshot, sz);
                         kv_caches[i]->len = kv_snapshots[i].len;
+                        // Restore QJL packed K snapshot
+                        if (g_use_qjl && kv_caches[i]->qjl_k_cache && kv_snapshots[i].qjl_k_snapshot) {
+                            size_t qjl_sz = (size_t)sys_prompt_len * NUM_KV_HEADS * QJL_PACKED_PER_HEAD * sizeof(uint32_t);
+                            memcpy(kv_caches[i]->qjl_k_cache, kv_snapshots[i].qjl_k_snapshot, qjl_sz);
+                        }
                         // Also restore GPU KV mirror
                         if (g_metal) {
                             int fa_idx = (i + 1) / FULL_ATTN_INTERVAL - 1;
@@ -6261,6 +6419,12 @@ static void serve_loop(
                                        kv_snapshots[i].k_snapshot, sz);
                                 memcpy([g_metal->buf_kv_v[fa_idx] contents],
                                        kv_snapshots[i].v_snapshot, sz);
+                                // Restore GPU QJL buffer
+                                if (g_use_qjl && g_metal->buf_qjl_k[fa_idx] && kv_snapshots[i].qjl_k_snapshot) {
+                                    size_t qjl_sz = (size_t)sys_prompt_len * NUM_KV_HEADS * QJL_PACKED_PER_HEAD * sizeof(uint32_t);
+                                    memcpy([g_metal->buf_qjl_k[fa_idx] contents],
+                                           kv_snapshots[i].qjl_k_snapshot, qjl_sz);
+                                }
                             }
                         }
                     } else if (kv_caches[i]) {
@@ -6281,10 +6445,10 @@ static void serve_loop(
                     for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
                         if (gpu_delta_snapshots[i] && g_metal->buf_delta_state[i])
                             memcpy([g_metal->buf_delta_state[i] contents],
-                                   gpu_delta_snapshots[i], 64*128*128*sizeof(float));
+                                   gpu_delta_snapshots[i], 32*128*128*sizeof(float));
                         if (gpu_conv_snapshots[i] && g_metal->buf_conv_state[i])
                             memcpy([g_metal->buf_conv_state[i] contents],
-                                   gpu_conv_snapshots[i], 3*12288*sizeof(float));
+                                   gpu_conv_snapshots[i], 3*8192*sizeof(float));
                     }
                 } else {
                     reset_delta_net_state();
@@ -6513,6 +6677,7 @@ static void print_usage(const char *prog) {
     printf("  --freq               Enable expert frequency tracking + analysis\n");
     printf("  --cache-telemetry    Report cold vs eviction misses and reuse distance\n");
     printf("  --2bit               Use 2-bit quantized experts (packed_experts_2bit/)\n");
+    printf("  --qjl                Enable QJL 1-bit KV cache compression (32x K reduction)\n");
     printf("  --gpu-linear         Alias for the fused GPU delta-net path (default)\n");
     printf("  --predict            Enable temporal expert prediction (prefetch during CMD1_wait)\n");
     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
@@ -6552,6 +6717,7 @@ int main(int argc, char **argv) {
             {"freq",          no_argument,       0, 'F'},
             {"cache-telemetry", no_argument,     0, 'E'},
             {"2bit",          no_argument,       0, '2'},
+            {"qjl",           no_argument,       0, 'Q'},
             {"gpu-linear",    no_argument,       0, 'G'},
             {"think-budget",  required_argument, 0, 'B'},
             {"serve",         required_argument, 0, 'R'},
@@ -6562,7 +6728,7 @@ int main(int argc, char **argv) {
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2Gh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2QGh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -6580,6 +6746,7 @@ int main(int argc, char **argv) {
                 case 'F': g_freq_tracking = 1; break;
                 case 'E': g_cache_telemetry_enabled = 1; break;
                 case '2': g_use_2bit = 1; break;
+                case 'Q': g_use_qjl = 1; break;
                 case 'G': gpu_linear_attn_enabled = 1; break;
                 case 'D': g_pred_enabled = 1; break;
                 case 'Z':
@@ -6634,6 +6801,11 @@ int main(int argc, char **argv) {
             fprintf(stderr, "WARNING: Metal init failed, falling back to CPU\n");
         }
 
+        // ---- Initialize QJL projection matrices (if requested) ----
+        if (g_use_qjl) {
+            qjl_init_projections();
+        }
+
         // ---- Initialize persistent I/O thread pool ----
         io_pool_init();
 
@@ -6648,13 +6820,14 @@ int main(int argc, char **argv) {
             g_expert_cache = expert_cache_new(g_metal->device, cache_entries);
         }
 
-        printf("=== Qwen3.5-397B-A17B Metal Inference Engine ===\n");
+        printf("=== Qwen3.5-35B-A3B Metal Inference Engine ===\n");
         printf("Model:    %s\n", model_path);
         printf("Weights:  %s\n", weights_path);
         printf("Manifest: %s\n", manifest_path);
         printf("Vocab:    %s\n", vocab_path);
         printf("K:        %d experts/layer\n", K);
         printf("Quant:    %s experts (%zu bytes each)\n", g_use_2bit ? "2-bit" : "4-bit", active_expert_size());
+        printf("KV cache: %s\n", g_use_qjl ? "QJL 1-bit K compression (32x reduction)" : "float32");
         printf("Linear:   %s\n", gpu_linear_attn_enabled ? "fused GPU delta-net" : "CPU/hybrid fallback");
         printf("Tokens:   %d\n", max_tokens);
         if (g_malloc_cache) {

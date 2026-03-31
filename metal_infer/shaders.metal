@@ -17,12 +17,12 @@
  *   - Groups of 64 elements share one (scale, bias) pair
  *
  * Matrix layout for expert projections:
- *   gate_proj/up_proj: [1024, 512] uint32 = [1024, 4096] logical (out=1024, in=4096)
- *   down_proj: [4096, 128] uint32 = [4096, 1024] logical (out=4096, in=1024)
+ *   gate_proj/up_proj: [512, 256] uint32 = [512, 2048] logical (out=512, in=2048)
+ *   down_proj: [2048, 64] uint32 = [2048, 512] logical (out=2048, in=512)
  *
  *   Scales/biases: [out_dim, in_dim/group_size]
- *   gate/up scales: [1024, 64]   (4096/64 = 64 groups)
- *   down scales:    [4096, 16]   (1024/64 = 16 groups)
+ *   gate/up scales: [512, 32]   (2048/64 = 32 groups)
+ *   down scales:    [2048, 8]   (512/64 = 8 groups)
  */
 
 #include <metal_stdlib>
@@ -271,7 +271,7 @@ kernel void dequant_matvec_4bit_v3(
     // ---- Cache input vector in threadgroup shared memory ----
     // Max in_dim = 4096, so we need 4096 floats = 16KB shared memory
     // This is well within the 32KB threadgroup memory limit on M3
-    threadgroup float x_shared[4096];
+    threadgroup float x_shared[2048];
 
     // Cooperative load: 256 threads load 4096 floats (16 per thread)
     // ALL threads must participate in this load + barrier, even if their
@@ -369,7 +369,7 @@ kernel void dequant_matvec_4bit_v5(
     uint num_groups  = in_dim / group_size;
     uint packed_per_group = group_size / 8;
 
-    threadgroup float x_shared[4096];
+    threadgroup float x_shared[2048];
     for (uint i = lid; i < in_dim; i += 256) {
         x_shared[i] = x[i];
     }
@@ -443,7 +443,7 @@ kernel void dequant_matvec_2bit(
     uint packed_cols = in_dim / 16;  // 16 values per uint32 for 2-bit
     uint num_groups  = in_dim / group_size;
 
-    threadgroup float x_shared[4096];
+    threadgroup float x_shared[2048];
     for (uint i = lid; i < in_dim; i += 256) {
         x_shared[i] = x[i];
     }
@@ -524,7 +524,7 @@ kernel void dequant_matvec_4bit_v4(
     uint num_groups  = in_dim / group_size;
 
     // Cache input vector — ALL threads must participate before the barrier
-    threadgroup float x_shared[4096];
+    threadgroup float x_shared[2048];
     for (uint i = lid; i < in_dim; i += 256) {
         x_shared[i] = x[i];
     }
@@ -621,7 +621,7 @@ kernel void dequant_matvec_4bit_batched(
     uint num_groups  = in_dim / group_size;
 
     // Cache this expert's input vector
-    threadgroup float x_shared[4096];
+    threadgroup float x_shared[2048];
     device const float* x_k = x_inputs + expert_k * in_dim;
     for (uint i = lid; i < in_dim; i += 256) {
         x_shared[i] = x_k[i];
@@ -894,6 +894,47 @@ kernel void attn_scores_batched(
     }
 }
 
+
+// ============================================================================
+// Kernel 6b: QJL approximate attention scores — 1-bit KV cache compression
+// XOR + popcount on packed sign projections, one SIMD group per (head, position)
+// ============================================================================
+
+kernel void qjl_attn_scores_batched(
+    device const uint32_t* packed_Q     [[buffer(0)]],  // [num_heads * packed_per_head]
+    device const uint32_t* packed_K     [[buffer(1)]],  // [max_seq * num_kv_heads * packed_per_head]
+    device float*          scores       [[buffer(2)]],  // [num_heads, seq_stride]
+    constant uint&         head_dim     [[buffer(3)]],  // 256
+    constant uint&         kv_packed_stride [[buffer(4)]], // num_kv_heads * packed_per_head
+    constant uint&         seq_len      [[buffer(5)]],  // current sequence length
+    constant uint&         seq_stride   [[buffer(6)]],  // GPU_KV_SEQ
+    constant float&        scale        [[buffer(7)]],  // 1/sqrt(head_dim)
+    constant uint&         heads_per_kv [[buffer(8)]],  // GQA ratio (16/2 = 8)
+    constant uint&         packed_per_head [[buffer(9)]], // QJL_PACKED_PER_HEAD = 8
+    uint tgid  [[threadgroup_position_in_grid]],
+    uint lid   [[thread_position_in_threadgroup]]
+) {
+    uint pos = tgid % seq_len;
+    uint h = tgid / seq_len;
+    if (pos >= seq_len) return;
+
+    uint kv_h = h / heads_per_kv;
+    device const uint32_t* pq = packed_Q + h * packed_per_head;
+    device const uint32_t* pk = packed_K + pos * kv_packed_stride + kv_h * packed_per_head;
+
+    // Each thread handles a subset of the packed words
+    int local_hamming = 0;
+    for (uint i = lid; i < packed_per_head; i += 32) {
+        local_hamming += popcount(pq[i] ^ pk[i]);
+    }
+
+    // SIMD reduction (single SIMD group = 32 threads)
+    float total_hamming = simd_sum((float)local_hamming);
+    if (lid == 0) {
+        // Approximate dot product: (d - 2*hamming) * scale
+        scores[h * seq_stride + pos] = ((float)head_dim - 2.0f * total_hamming) * scale;
+    }
+}
 
 // ============================================================================
 // Kernel 7: Batched softmax — one threadgroup per head
