@@ -958,6 +958,88 @@ kernel void qjl_attn_scores_batched(
 }
 
 // ============================================================================
+// TurboQuant attention scores: MSE codebook lookup + QJL residual correction
+// Computes: score = (dot(q_rot, codebook[mse_idx]) + sqrt(pi/2) * ||r|| * qjl_approx) * scale
+// ============================================================================
+
+kernel void tq_attn_scores_batched(
+    device const float*    rotated_Q       [[buffer(0)]],   // [num_heads * head_dim]
+    device const uint32_t* mse_K           [[buffer(1)]],   // [max_seq * kv_mse_stride]
+    device const uint32_t* qjl_K           [[buffer(2)]],   // [max_seq * kv_qjl_stride]
+    device const uint32_t* projected_Q     [[buffer(3)]],   // [num_heads * 8] packed sign bits
+    device const half*     residual_norms  [[buffer(4)]],   // [max_seq * num_kv_heads]
+    device float*          scores          [[buffer(5)]],   // [num_heads, seq_stride]
+    constant float*        codebook        [[buffer(6)]],   // [2^(tq_bits-1)] centroids
+    constant uint&         head_dim        [[buffer(7)]],   // 256
+    constant uint&         seq_len         [[buffer(8)]],
+    constant uint&         seq_stride      [[buffer(9)]],   // GPU_KV_SEQ
+    constant float&        scale           [[buffer(10)]],  // 1/sqrt(head_dim)
+    constant uint&         heads_per_kv    [[buffer(11)]],  // 8 (16 Q heads / 2 KV heads)
+    constant uint&         tq_bits         [[buffer(12)]],  // 2, 3, or 4
+    constant uint&         mse_u32_per_head [[buffer(13)]],
+    constant uint&         kv_mse_stride   [[buffer(14)]],  // num_kv_heads * mse_u32_per_head
+    constant uint&         kv_qjl_stride   [[buffer(15)]],  // num_kv_heads * 8
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]]
+) {
+    uint pos = tgid % seq_len;
+    uint h   = tgid / seq_len;
+    if (pos >= seq_len) return;
+
+    uint kv_h = h / heads_per_kv;
+
+    // ---- Part 1: MSE codebook dot product ----
+    device const uint32_t* mse_data = mse_K + pos * kv_mse_stride + kv_h * mse_u32_per_head;
+    uint mse_bits = tq_bits - 1;
+
+    float mse_partial = 0.0f;
+    if (mse_bits == 1) {
+        // 1-bit MSE: 32 indices per uint32
+        for (uint d = lid; d < head_dim; d += 32) {
+            uint word_idx = d >> 5;
+            uint bit_pos  = d & 31;
+            uint idx = (mse_data[word_idx] >> bit_pos) & 0x1;
+            mse_partial += rotated_Q[h * head_dim + d] * codebook[idx];
+        }
+    } else if (mse_bits == 2) {
+        // 2-bit MSE: 16 indices per uint32
+        for (uint d = lid; d < head_dim; d += 32) {
+            uint word_idx = d >> 4;
+            uint bit_pos  = (d & 15) * 2;
+            uint idx = (mse_data[word_idx] >> bit_pos) & 0x3;
+            mse_partial += rotated_Q[h * head_dim + d] * codebook[idx];
+        }
+    } else {
+        // 3-bit MSE: 10 indices per uint32 (2 wasted bits)
+        for (uint d = lid; d < head_dim; d += 32) {
+            uint word_idx = d / 10;
+            uint bit_pos  = (d % 10) * 3;
+            uint idx = (mse_data[word_idx] >> bit_pos) & 0x7;
+            mse_partial += rotated_Q[h * head_dim + d] * codebook[idx];
+        }
+    }
+    float mse_total = simd_sum(mse_partial);
+
+    // ---- Part 2: QJL residual (XOR + popcount) ----
+    device const uint32_t* pq = projected_Q + h * 8;
+    device const uint32_t* pk = qjl_K + pos * kv_qjl_stride + kv_h * 8;
+
+    int local_hamming = 0;
+    for (uint i = lid; i < 8; i += 32) {
+        local_hamming += popcount(pq[i] ^ pk[i]);
+    }
+    float total_hamming = simd_sum((float)local_hamming);
+
+    // ---- Part 3: Combine (thread 0 only) ----
+    if (lid == 0) {
+        uint num_kv_heads = kv_qjl_stride / 8;
+        float r_norm_f = float(residual_norms[pos * num_kv_heads + kv_h]);
+        float qjl_score = 1.2533141f * r_norm_f * (float(head_dim) - 2.0f * total_hamming) / float(head_dim);
+        scores[h * seq_stride + pos] = (mse_total + qjl_score) * scale;
+    }
+}
+
+// ============================================================================
 // Kernel 7: Batched softmax — one threadgroup per head
 // ============================================================================
 

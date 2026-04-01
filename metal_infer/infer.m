@@ -135,6 +135,32 @@
 // Projects K vectors through random ±1 matrix, stores sign bits only (32x compression)
 #define QJL_PACKED_PER_HEAD 8  // HEAD_DIM(256) bits / 32 bits per uint32 = 8 uint32s per head
 
+// TurboQuant multi-bit KV cache compression (MSE quantizer + QJL residual)
+#define TQ_MAX_BITS 4
+static int g_tq_bits = 0;  // 0=disabled, 2/3/4=total bits per coordinate
+// MSE packed uint32s per head for each bit-width:
+// b=2: 1-bit MSE -> 256/32=8, b=3: 2-bit MSE -> 256/16=16, b=4: 3-bit MSE -> ceil(256/10)=26
+static const int TQ_MSE_U32_PER_HEAD[] = {0, 0, 8, 16, 26};
+
+// Lloyd-Max codebook centroids for N(0, 1/sqrt(256)) = N(0, 0.0625)
+// b=2: 1-bit MSE (2 centroids)
+static const float TQ_CODEBOOK_2[] = { -0.04987f, 0.04987f };
+// b=3: 2-bit MSE (4 centroids)
+static const float TQ_CODEBOOK_3[] = { -0.09440f, -0.02830f, 0.02830f, 0.09440f };
+// b=4: 3-bit MSE (8 centroids)
+static const float TQ_CODEBOOK_4[] = { -0.13450f, -0.08399f, -0.04725f, -0.01532f,
+                                         0.01532f,  0.04725f,  0.08399f,  0.13450f };
+
+static const float *tq_codebook(void) {
+    switch (g_tq_bits) {
+        case 2: return TQ_CODEBOOK_2;
+        case 3: return TQ_CODEBOOK_3;
+        case 4: return TQ_CODEBOOK_4;
+        default: return NULL;
+    }
+}
+static int tq_num_centroids(void) { return g_tq_bits > 0 ? (1 << (g_tq_bits - 1)) : 0; }
+
 // Special tokens
 #define EOS_TOKEN_1         248046
 #define EOS_TOKEN_2         248044
@@ -1028,6 +1054,14 @@ typedef struct {
     // QJL 1-bit KV cache buffers (compressed K cache for full attention layers)
     id<MTLBuffer> buf_qjl_k[NUM_FULL_ATTN_LAYERS];   // packed K: [GPU_KV_SEQ * NUM_KV_HEADS * QJL_PACKED_PER_HEAD uint32s]
     id<MTLBuffer> buf_qjl_packed_q;                    // packed Q: [NUM_ATTN_HEADS * QJL_PACKED_PER_HEAD uint32s]
+    // TurboQuant buffers (MSE + QJL residual KV cache compression)
+    id<MTLBuffer> buf_tq_mse_k[NUM_FULL_ATTN_LAYERS];
+    id<MTLBuffer> buf_tq_qjl_k[NUM_FULL_ATTN_LAYERS];
+    id<MTLBuffer> buf_tq_norms[NUM_FULL_ATTN_LAYERS];
+    id<MTLBuffer> buf_tq_rotated_q;
+    id<MTLBuffer> buf_tq_projected_q;
+    id<MTLBuffer> buf_tq_codebook;
+    id<MTLComputePipelineState> tq_attn_scores_pipe;
     // CMD3 GPU-side combine buffers (weighted_sum + residual + norm on GPU)
     id<MTLComputePipelineState> moe_combine_residual;  // fused combine kernel
     id<MTLBuffer> buf_moe_hidden;     // [HIDDEN_DIM floats] GPU combine output (hidden state)
@@ -1097,6 +1131,61 @@ static void qjl_encode_key(const float *k, const float *R, uint32_t *packed) {
     }
 }
 
+// Float16 conversion helpers (for TurboQuant residual norms)
+static inline uint16_t f32_to_f16_bits(float f) {
+    __fp16 h = (__fp16)f;
+    uint16_t bits;
+    memcpy(&bits, &h, 2);
+    return bits;
+}
+static inline float f16_to_f32_bits(uint16_t bits) {
+    __fp16 h;
+    memcpy(&h, &bits, 2);
+    return (float)h;
+}
+
+// TurboQuant encode: Hadamard rotate -> MSE quantize -> QJL on residual
+static void tq_encode_key(const float *k, const float *R,
+                          uint32_t *mse_packed, uint32_t *qjl_packed, uint16_t *norm_out) {
+    float rotated[HEAD_DIM];
+    memcpy(rotated, k, HEAD_DIM * sizeof(float));
+    cpu_hadamard_transform(rotated, HEAD_DIM);
+
+    const float *cb = tq_codebook();
+    if (!cb) return;
+    int ncent = tq_num_centroids();
+    int mse_bits = g_tq_bits - 1;
+    int indices_per_u32 = 32 / mse_bits;
+
+    float dequant[HEAD_DIM];
+    memset(mse_packed, 0, TQ_MSE_U32_PER_HEAD[g_tq_bits] * sizeof(uint32_t));
+
+    for (int j = 0; j < HEAD_DIM; j++) {
+        int best = 0;
+        float best_dist = fabsf(rotated[j] - cb[0]);
+        for (int c = 1; c < ncent; c++) {
+            float dist = fabsf(rotated[j] - cb[c]);
+            if (dist < best_dist) { best_dist = dist; best = c; }
+        }
+        dequant[j] = cb[best];
+        int word = j / indices_per_u32;
+        int bit_pos = (j % indices_per_u32) * mse_bits;
+        mse_packed[word] |= ((uint32_t)best << bit_pos);
+    }
+
+    // Residual in rotated space
+    float residual[HEAD_DIM];
+    float norm_sq = 0.0f;
+    for (int j = 0; j < HEAD_DIM; j++) {
+        residual[j] = rotated[j] - dequant[j];
+        norm_sq += residual[j] * residual[j];
+    }
+    *norm_out = f32_to_f16_bits(sqrtf(norm_sq));
+
+    // QJL encode residual
+    qjl_encode_key(residual, R, qjl_packed);
+}
+
 static MetalCtx *metal_setup(void) {
     MetalCtx *ctx = calloc(1, sizeof(MetalCtx));
     ctx->device = MTLCreateSystemDefaultDevice();
@@ -1161,6 +1250,7 @@ static MetalCtx *metal_setup(void) {
     ctx->attn_values_pipe  = makePipe(@"attn_values_batched");
     ctx->sigmoid_gate_pipe = makePipe(@"sigmoid_gate");
     ctx->qjl_attn_scores_pipe = makePipe(@"qjl_attn_scores_batched");
+    ctx->tq_attn_scores_pipe = makePipe(@"tq_attn_scores_batched");
     ctx->moe_combine_residual = makePipe(@"moe_combine_residual");
     ctx->delta_net_step    = makePipe(@"gated_delta_net_step");
     ctx->conv1d_step       = makePipe(@"conv1d_step");
@@ -1309,6 +1399,34 @@ static MetalCtx *metal_setup(void) {
             printf("[metal] QJL buffers: %d layers x %.1f KB K-cache + %.0f B packed Q\n",
                    NUM_FULL_ATTN_LAYERS, qjl_kv_size / 1024.0,
                    (double)(NUM_ATTN_HEADS * QJL_PACKED_PER_HEAD * sizeof(uint32_t)));
+        }
+        // TurboQuant compressed K cache buffers
+        if (g_tq_bits > 0) {
+            int mse_per_head = TQ_MSE_U32_PER_HEAD[g_tq_bits];
+            size_t tq_mse_size = (size_t)GPU_KV_SEQ * NUM_KV_HEADS * mse_per_head * sizeof(uint32_t);
+            size_t tq_qjl_size = (size_t)GPU_KV_SEQ * NUM_KV_HEADS * QJL_PACKED_PER_HEAD * sizeof(uint32_t);
+            size_t tq_norm_size = (size_t)GPU_KV_SEQ * NUM_KV_HEADS * sizeof(uint16_t);
+            for (int i = 0; i < NUM_FULL_ATTN_LAYERS; i++) {
+                ctx->buf_tq_mse_k[i] = [ctx->device newBufferWithLength:tq_mse_size
+                                                                options:MTLResourceStorageModeShared];
+                ctx->buf_tq_qjl_k[i] = [ctx->device newBufferWithLength:tq_qjl_size
+                                                                options:MTLResourceStorageModeShared];
+                ctx->buf_tq_norms[i] = [ctx->device newBufferWithLength:tq_norm_size
+                                                               options:MTLResourceStorageModeShared];
+            }
+            ctx->buf_tq_rotated_q = [ctx->device newBufferWithLength:
+                                     NUM_ATTN_HEADS * HEAD_DIM * sizeof(float)
+                                                             options:MTLResourceStorageModeShared];
+            ctx->buf_tq_projected_q = [ctx->device newBufferWithLength:
+                                       NUM_ATTN_HEADS * QJL_PACKED_PER_HEAD * sizeof(uint32_t)
+                                                               options:MTLResourceStorageModeShared];
+            const float *cb = tq_codebook();
+            int ncent = tq_num_centroids();
+            ctx->buf_tq_codebook = [ctx->device newBufferWithLength:16 * sizeof(float)
+                                                            options:MTLResourceStorageModeShared];
+            memcpy([ctx->buf_tq_codebook contents], cb, ncent * sizeof(float));
+            printf("[metal] TQ-%d buffers: %d layers (MSE %.1f KB + QJL %.1f KB + norms %.1f KB each)\n",
+                   g_tq_bits, NUM_FULL_ATTN_LAYERS, tq_mse_size/1024.0, tq_qjl_size/1024.0, tq_norm_size/1024.0);
         }
     }
 
@@ -2169,6 +2287,10 @@ typedef struct {
     float *k_cache;  // [max_seq, num_kv_heads * head_dim]
     float *v_cache;  // [max_seq, num_kv_heads * head_dim]
     uint32_t *qjl_k_cache;  // [max_seq, num_kv_heads * QJL_PACKED_PER_HEAD] (QJL mode only)
+    // TurboQuant fields (when g_tq_bits > 0)
+    uint32_t *tq_mse_cache;   // [max_seq, NUM_KV_HEADS * TQ_MSE_U32_PER_HEAD[g_tq_bits]]
+    uint32_t *tq_qjl_cache;   // [max_seq, NUM_KV_HEADS * QJL_PACKED_PER_HEAD]
+    uint16_t *tq_norm_cache;  // [max_seq, NUM_KV_HEADS] float16 residual norms
     int len;         // current number of cached entries
 } KVCache;
 
@@ -2179,6 +2301,12 @@ static KVCache *kv_cache_new(void) {
     if (g_use_qjl) {
         c->qjl_k_cache = calloc((size_t)MAX_SEQ_LEN * NUM_KV_HEADS * QJL_PACKED_PER_HEAD, sizeof(uint32_t));
     }
+    if (g_tq_bits > 0) {
+        int mse_per_head = TQ_MSE_U32_PER_HEAD[g_tq_bits];
+        c->tq_mse_cache = calloc((size_t)MAX_SEQ_LEN * NUM_KV_HEADS * mse_per_head, sizeof(uint32_t));
+        c->tq_qjl_cache = calloc((size_t)MAX_SEQ_LEN * NUM_KV_HEADS * QJL_PACKED_PER_HEAD, sizeof(uint32_t));
+        c->tq_norm_cache = calloc((size_t)MAX_SEQ_LEN * NUM_KV_HEADS, sizeof(uint16_t));
+    }
     c->len = 0;
     return c;
 }
@@ -2188,6 +2316,9 @@ static void kv_cache_free(KVCache *c) {
         free(c->k_cache);
         free(c->v_cache);
         free(c->qjl_k_cache);
+        free(c->tq_mse_cache);
+        free(c->tq_qjl_cache);
+        free(c->tq_norm_cache);
         free(c);
     }
 }
@@ -4663,6 +4794,33 @@ static void fused_layer_forward(
             }
         }
 
+        // TurboQuant: encode K via Hadamard + MSE quantize + QJL residual
+        if (g_tq_bits > 0 && fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS) {
+            float *R = g_qjl_R[fa_idx];
+            for (int kv_h = 0; kv_h < NUM_KV_HEADS; kv_h++) {
+                int mse_per_head = TQ_MSE_U32_PER_HEAD[g_tq_bits];
+                uint32_t mse_packed[26];  // max for b=4: ceil(256/10)=26
+                uint32_t qjl_packed[QJL_PACKED_PER_HEAD];
+                uint16_t norm;
+                tq_encode_key(k_out + kv_h * HEAD_DIM, R, mse_packed, qjl_packed, &norm);
+                // Write to CPU caches
+                size_t mse_off = (size_t)cache_pos * NUM_KV_HEADS * mse_per_head + kv_h * mse_per_head;
+                memcpy(kv->tq_mse_cache + mse_off, mse_packed, mse_per_head * sizeof(uint32_t));
+                size_t qjl_off = (size_t)cache_pos * NUM_KV_HEADS * QJL_PACKED_PER_HEAD
+                                 + kv_h * QJL_PACKED_PER_HEAD;
+                memcpy(kv->tq_qjl_cache + qjl_off, qjl_packed, QJL_PACKED_PER_HEAD * sizeof(uint32_t));
+                kv->tq_norm_cache[cache_pos * NUM_KV_HEADS + kv_h] = norm;
+                // Write to GPU buffers
+                if (g_metal && g_metal->buf_tq_mse_k[fa_idx]) {
+                    memcpy((uint32_t *)[g_metal->buf_tq_mse_k[fa_idx] contents] + mse_off,
+                           mse_packed, mse_per_head * sizeof(uint32_t));
+                    memcpy((uint32_t *)[g_metal->buf_tq_qjl_k[fa_idx] contents] + qjl_off,
+                           qjl_packed, QJL_PACKED_PER_HEAD * sizeof(uint32_t));
+                    ((uint16_t *)[g_metal->buf_tq_norms[fa_idx] contents])[cache_pos * NUM_KV_HEADS + kv_h] = norm;
+                }
+            }
+        }
+
         if (g_metal && g_metal->attn_scores_pipe && fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS) {
             memcpy((float *)[g_metal->buf_kv_k[fa_idx] contents] + cache_pos * kv_dim,
                    k_out, kv_dim * sizeof(float));
@@ -4697,10 +4855,65 @@ static void fused_layer_forward(
                     qjl_encode_key(q + h * HEAD_DIM, R, gpu_pq + h * QJL_PACKED_PER_HEAD);
                 }
             }
+            // TurboQuant: Hadamard-rotate Q and QJL-project rotated Q
+            if (g_tq_bits > 0 && g_metal->buf_tq_rotated_q) {
+                float *R = g_qjl_R[fa_idx];
+                float *gpu_rq = (float *)[g_metal->buf_tq_rotated_q contents];
+                uint32_t *gpu_pq = (uint32_t *)[g_metal->buf_tq_projected_q contents];
+                for (int h = 0; h < NUM_ATTN_HEADS; h++) {
+                    memcpy(gpu_rq + h * HEAD_DIM, q + h * HEAD_DIM, HEAD_DIM * sizeof(float));
+                    cpu_hadamard_transform(gpu_rq + h * HEAD_DIM, HEAD_DIM);
+                    qjl_encode_key(gpu_rq + h * HEAD_DIM, R, gpu_pq + h * QJL_PACKED_PER_HEAD);
+                }
+            }
             // attn_out_for_oproj will be set to NULL below — CMD2 reads buf_attn_out
         } else {
             // CPU fallback
-            if (g_use_qjl && kv->qjl_k_cache) {
+            if (g_tq_bits > 0 && kv->tq_mse_cache) {
+                // TurboQuant CPU attention
+                float *R = g_qjl_R[fa_idx];
+                int mse_per_head = TQ_MSE_U32_PER_HEAD[g_tq_bits];
+                int mse_bits = g_tq_bits - 1;
+                int indices_per_u32 = 32 / mse_bits;
+                const float *cb = tq_codebook();
+                float sqrt_pi_2 = sqrtf((float)M_PI / 2.0f);
+                for (int h = 0; h < NUM_ATTN_HEADS; h++) {
+                    int kv_h = h / heads_per_kv;
+                    float q_rot[HEAD_DIM];
+                    memcpy(q_rot, q + h * HEAD_DIM, HEAD_DIM * sizeof(float));
+                    cpu_hadamard_transform(q_rot, HEAD_DIM);
+                    uint32_t q_proj[QJL_PACKED_PER_HEAD];
+                    qjl_encode_key(q_rot, R, q_proj);
+                    float *scores = malloc(kv->len * sizeof(float));
+                    for (int p = 0; p < kv->len; p++) {
+                        size_t mse_off = (size_t)p * NUM_KV_HEADS * mse_per_head + kv_h * mse_per_head;
+                        uint32_t *mse_data = kv->tq_mse_cache + mse_off;
+                        float mse_score = 0.0f;
+                        for (int j = 0; j < HEAD_DIM; j++) {
+                            int word = j / indices_per_u32;
+                            int bit_pos = (j % indices_per_u32) * mse_bits;
+                            int idx = (mse_data[word] >> bit_pos) & ((1 << mse_bits) - 1);
+                            mse_score += q_rot[j] * cb[idx];
+                        }
+                        size_t qjl_off = (size_t)p * NUM_KV_HEADS * QJL_PACKED_PER_HEAD
+                                         + kv_h * QJL_PACKED_PER_HEAD;
+                        uint32_t *qjl_data = kv->tq_qjl_cache + qjl_off;
+                        int hamming = 0;
+                        for (int i = 0; i < QJL_PACKED_PER_HEAD; i++)
+                            hamming += __builtin_popcount(q_proj[i] ^ qjl_data[i]);
+                        float r_norm = f16_to_f32_bits(kv->tq_norm_cache[p * NUM_KV_HEADS + kv_h]);
+                        float qjl_score = sqrt_pi_2 * r_norm * (float)(HEAD_DIM - 2 * hamming) / (float)HEAD_DIM;
+                        scores[p] = (mse_score + qjl_score) * scale;
+                    }
+                    cpu_softmax(scores, kv->len);
+                    float *oh = attn_out + h * HEAD_DIM;
+                    for (int p = 0; p < kv->len; p++) {
+                        float *vp = kv->v_cache + p * kv_dim + kv_h * HEAD_DIM;
+                        for (int d = 0; d < HEAD_DIM; d++) oh[d] += scores[p] * vp[d];
+                    }
+                    free(scores);
+                }
+            } else if (g_use_qjl && kv->qjl_k_cache) {
                 // QJL CPU attention: pack Q once per head, score via XOR+popcount
                 float *R = g_qjl_R[fa_idx];
                 for (int h = 0; h < NUM_ATTN_HEADS; h++) {
@@ -5006,8 +5219,37 @@ static void fused_layer_forward(
             uint32_t seq_stride = GPU_KV_SEQ;
             uint32_t hpkv = (uint32_t)heads_per_kv;
 
-            // Enc A1: attn_scores_batched (or QJL variant)
-            if (g_use_qjl && g_metal->qjl_attn_scores_pipe && g_metal->buf_qjl_k[fa_idx]) {
+            // Enc A1: attn_scores_batched (or TQ/QJL variant)
+            if (g_tq_bits > 0 && g_metal->tq_attn_scores_pipe && g_metal->buf_tq_mse_k[fa_idx]) {
+                // TurboQuant GPU attention scores
+                int mse_per_head = TQ_MSE_U32_PER_HEAD[g_tq_bits];
+                uint32_t tq_bits_u = (uint32_t)g_tq_bits;
+                uint32_t mse_per_head_u = (uint32_t)mse_per_head;
+                uint32_t kv_mse_stride_u = (uint32_t)(NUM_KV_HEADS * mse_per_head);
+                uint32_t kv_qjl_stride_u = (uint32_t)(NUM_KV_HEADS * QJL_PACKED_PER_HEAD);
+                id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->tq_attn_scores_pipe];
+                [enc setBuffer:g_metal->buf_tq_rotated_q     offset:0 atIndex:0];
+                [enc setBuffer:g_metal->buf_tq_mse_k[fa_idx] offset:0 atIndex:1];
+                [enc setBuffer:g_metal->buf_tq_qjl_k[fa_idx] offset:0 atIndex:2];
+                [enc setBuffer:g_metal->buf_tq_projected_q   offset:0 atIndex:3];
+                [enc setBuffer:g_metal->buf_tq_norms[fa_idx] offset:0 atIndex:4];
+                [enc setBuffer:g_metal->buf_attn_scores      offset:0 atIndex:5];
+                [enc setBuffer:g_metal->buf_tq_codebook      offset:0 atIndex:6];
+                [enc setBytes:&hd              length:4 atIndex:7];
+                [enc setBytes:&sl              length:4 atIndex:8];
+                [enc setBytes:&seq_stride      length:4 atIndex:9];
+                [enc setBytes:&scale           length:4 atIndex:10];
+                [enc setBytes:&hpkv            length:4 atIndex:11];
+                [enc setBytes:&tq_bits_u       length:4 atIndex:12];
+                [enc setBytes:&mse_per_head_u  length:4 atIndex:13];
+                [enc setBytes:&kv_mse_stride_u length:4 atIndex:14];
+                [enc setBytes:&kv_qjl_stride_u length:4 atIndex:15];
+                uint32_t total_tgs = sl * NUM_ATTN_HEADS;
+                [enc dispatchThreadgroups:MTLSizeMake(total_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                [enc endEncoding];
+            } else if (g_use_qjl && g_metal->qjl_attn_scores_pipe && g_metal->buf_qjl_k[fa_idx]) {
                 // QJL path: XOR + popcount on packed sign projections
                 uint32_t kv_packed_stride = NUM_KV_HEADS * QJL_PACKED_PER_HEAD;
                 uint32_t pph = QJL_PACKED_PER_HEAD;
@@ -6283,6 +6525,9 @@ static void serve_loop(
         float *k_snapshot;
         float *v_snapshot;
         uint32_t *qjl_k_snapshot;  // QJL packed K snapshot (NULL if not using QJL)
+        uint32_t *tq_mse_snapshot;
+        uint32_t *tq_qjl_snapshot;
+        uint16_t *tq_norm_snapshot;
         int len;
     } KVSnapshot;
     KVSnapshot kv_snapshots[NUM_LAYERS];
@@ -6311,6 +6556,19 @@ static void serve_loop(
                 size_t qjl_sz = (size_t)sys_pos * NUM_KV_HEADS * QJL_PACKED_PER_HEAD * sizeof(uint32_t);
                 kv_snapshots[i].qjl_k_snapshot = malloc(qjl_sz);
                 memcpy(kv_snapshots[i].qjl_k_snapshot, kv_caches[i]->qjl_k_cache, qjl_sz);
+            }
+            // TurboQuant snapshot
+            if (g_tq_bits > 0 && kv_caches[i]->tq_mse_cache) {
+                int mse_per_head = TQ_MSE_U32_PER_HEAD[g_tq_bits];
+                size_t mse_sz = (size_t)sys_pos * NUM_KV_HEADS * mse_per_head * sizeof(uint32_t);
+                size_t qjl_sz = (size_t)sys_pos * NUM_KV_HEADS * QJL_PACKED_PER_HEAD * sizeof(uint32_t);
+                size_t norm_sz = (size_t)sys_pos * NUM_KV_HEADS * sizeof(uint16_t);
+                kv_snapshots[i].tq_mse_snapshot = malloc(mse_sz);
+                kv_snapshots[i].tq_qjl_snapshot = malloc(qjl_sz);
+                kv_snapshots[i].tq_norm_snapshot = malloc(norm_sz);
+                memcpy(kv_snapshots[i].tq_mse_snapshot, kv_caches[i]->tq_mse_cache, mse_sz);
+                memcpy(kv_snapshots[i].tq_qjl_snapshot, kv_caches[i]->tq_qjl_cache, qjl_sz);
+                memcpy(kv_snapshots[i].tq_norm_snapshot, kv_caches[i]->tq_norm_cache, norm_sz);
             }
         }
         if (layer_states[i]) {
@@ -6480,6 +6738,16 @@ static void serve_loop(
                             size_t qjl_sz = (size_t)sys_prompt_len * NUM_KV_HEADS * QJL_PACKED_PER_HEAD * sizeof(uint32_t);
                             memcpy(kv_caches[i]->qjl_k_cache, kv_snapshots[i].qjl_k_snapshot, qjl_sz);
                         }
+                        // Restore TurboQuant snapshot
+                        if (g_tq_bits > 0 && kv_caches[i]->tq_mse_cache && kv_snapshots[i].tq_mse_snapshot) {
+                            int mse_per_head = TQ_MSE_U32_PER_HEAD[g_tq_bits];
+                            size_t mse_sz = (size_t)sys_prompt_len * NUM_KV_HEADS * mse_per_head * sizeof(uint32_t);
+                            size_t qjl_sz = (size_t)sys_prompt_len * NUM_KV_HEADS * QJL_PACKED_PER_HEAD * sizeof(uint32_t);
+                            size_t norm_sz = (size_t)sys_prompt_len * NUM_KV_HEADS * sizeof(uint16_t);
+                            memcpy(kv_caches[i]->tq_mse_cache, kv_snapshots[i].tq_mse_snapshot, mse_sz);
+                            memcpy(kv_caches[i]->tq_qjl_cache, kv_snapshots[i].tq_qjl_snapshot, qjl_sz);
+                            memcpy(kv_caches[i]->tq_norm_cache, kv_snapshots[i].tq_norm_snapshot, norm_sz);
+                        }
                         // Also restore GPU KV mirror
                         if (g_metal) {
                             int fa_idx = (i + 1) / FULL_ATTN_INTERVAL - 1;
@@ -6493,6 +6761,19 @@ static void serve_loop(
                                     size_t qjl_sz = (size_t)sys_prompt_len * NUM_KV_HEADS * QJL_PACKED_PER_HEAD * sizeof(uint32_t);
                                     memcpy([g_metal->buf_qjl_k[fa_idx] contents],
                                            kv_snapshots[i].qjl_k_snapshot, qjl_sz);
+                                }
+                                // Restore GPU TQ buffers
+                                if (g_tq_bits > 0 && g_metal->buf_tq_mse_k[fa_idx] && kv_snapshots[i].tq_mse_snapshot) {
+                                    int mse_per_head = TQ_MSE_U32_PER_HEAD[g_tq_bits];
+                                    size_t mse_sz = (size_t)sys_prompt_len * NUM_KV_HEADS * mse_per_head * sizeof(uint32_t);
+                                    size_t qjl_sz = (size_t)sys_prompt_len * NUM_KV_HEADS * QJL_PACKED_PER_HEAD * sizeof(uint32_t);
+                                    size_t norm_sz = (size_t)sys_prompt_len * NUM_KV_HEADS * sizeof(uint16_t);
+                                    memcpy([g_metal->buf_tq_mse_k[fa_idx] contents],
+                                           kv_snapshots[i].tq_mse_snapshot, mse_sz);
+                                    memcpy([g_metal->buf_tq_qjl_k[fa_idx] contents],
+                                           kv_snapshots[i].tq_qjl_snapshot, qjl_sz);
+                                    memcpy([g_metal->buf_tq_norms[fa_idx] contents],
+                                           kv_snapshots[i].tq_norm_snapshot, norm_sz);
                                 }
                             }
                         }
@@ -6748,6 +7029,7 @@ static void print_usage(const char *prog) {
     printf("  --2bit               Use 2-bit quantized experts (packed_experts_2bit/)\n");
     printf("  --g256               Use Hadamard g256 experts (packed_experts_g256/)\n");
     printf("  --qjl                Enable QJL 1-bit KV cache compression (32x K reduction)\n");
+    printf("  --tq N               TurboQuant N-bit KV cache (N=2,3,4; recommended: 3)\n");
     printf("  --gpu-linear         Alias for the fused GPU delta-net path (default)\n");
     printf("  --predict            Enable temporal expert prediction (prefetch during CMD1_wait)\n");
     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
@@ -6794,12 +7076,13 @@ int main(int argc, char **argv) {
             {"serve",         required_argument, 0, 'R'},
             {"predict",       no_argument,       0, 'D'},
             {"collect-routing", required_argument, 0, 'Z'},
+            {"tq",            required_argument, 0, 'q'},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2HQGh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:q:LSTFE2HQGh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -6830,6 +7113,12 @@ int main(int argc, char **argv) {
                     break;
                 case 'B': g_think_budget = atoi(optarg); break;
                 case 'R': serve_port = atoi(optarg); break;
+                case 'q': g_tq_bits = atoi(optarg);
+                          if (g_tq_bits < 2 || g_tq_bits > 4) {
+                              fprintf(stderr, "ERROR: --tq must be 2, 3, or 4\n");
+                              return 1;
+                          }
+                          break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -6874,7 +7163,11 @@ int main(int argc, char **argv) {
         }
 
         // ---- Initialize QJL projection matrices (if requested) ----
-        if (g_use_qjl) {
+        if (g_tq_bits > 0 && g_use_qjl) {
+            fprintf(stderr, "ERROR: --tq and --qjl are mutually exclusive\n");
+            return 1;
+        }
+        if (g_use_qjl || g_tq_bits > 0) {
             qjl_init_projections();
         }
 
@@ -6901,7 +7194,11 @@ int main(int argc, char **argv) {
         printf("Quant:    %s experts (%zu bytes each)\n",
                g_use_2bit ? "2-bit" : g_use_g256 ? "4-bit g256 (Hadamard)" : "4-bit",
                active_expert_size());
-        printf("KV cache: %s\n", g_use_qjl ? "QJL 1-bit K compression (32x reduction)" : "float32");
+        printf("KV cache: %s\n",
+               g_tq_bits > 0 ? (g_tq_bits == 2 ? "TurboQuant 2-bit (1-bit MSE + 1-bit QJL, 15.5x)" :
+                               g_tq_bits == 3 ? "TurboQuant 3-bit (2-bit MSE + 1-bit QJL, 10.4x)" :
+                                                 "TurboQuant 4-bit (3-bit MSE + 1-bit QJL, 7.9x)") :
+               g_use_qjl ? "QJL 1-bit K compression (32x reduction)" : "float32");
         printf("Linear:   %s\n", gpu_linear_attn_enabled ? "fused GPU delta-net" : "CPU/hybrid fallback");
         printf("Tokens:   %d\n", max_tokens);
         if (g_malloc_cache) {
