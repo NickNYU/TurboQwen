@@ -18,7 +18,17 @@ The entire 209GB model streams from SSD through a custom Metal compute pipeline.
 | 2-bit experts, trust OS | 5.74 | Good* | 120GB on disk. *Breaks JSON/tool calling. |
 | 2-bit peak single token | 7.05 | Good* | Warm cache burst. *Not suitable for tool use. |
 
-*2-bit quantization produces `\name\` instead of `"name"` in JSON output, making tool calling unreliable. 4-bit is the production configuration.
+**KV cache compression** (M1 Max 32GB, Qwen3.5-35B-A3B, 100 tokens):
+
+| KV Config | tok/s | Compression | Quality | Notes |
+|-----------|-------|-------------|---------|-------|
+| float32 (default) | **12.27** | 1x | Baseline | Full precision K+V cache |
+| TurboQuant 2-bit (`--tq 2`) | **11.57** | 15.5x | Near-perfect | 1-bit MSE + 1-bit QJL residual |
+| TurboQuant 3-bit (`--tq 3`) | **10.34** | 10.4x | Quality-neutral | 2-bit MSE + 1-bit QJL residual. **Recommended.** |
+| TurboQuant 4-bit (`--tq 4`) | **11.32** | 7.9x | Quality-neutral | 3-bit MSE + 1-bit QJL residual |
+| QJL 1-bit (`--qjl`) | **11.28** | 32x | Good | Legacy. TQ-2 is faster and better quality. |
+
+*TurboQuant implements [Zandieh et al., 2025]: Hadamard rotation + Lloyd-Max MSE quantizer + QJL residual correction. At 3 bits/channel, attention KL divergence is effectively zero.*
 
 ## Hardware
 
@@ -53,7 +63,7 @@ The model has 60 transformer layers: 45 GatedDeltaNet (linear attention) + 15 st
 
 6. **Accelerate BLAS for Linear Attention** — The GatedDeltaNet recurrence uses `cblas_sscal`, `cblas_sgemv`, and `cblas_sger` for the 64-head × 128×128 state matrix update. 64% faster than scalar code.
 
-7. **QJL 1-bit KV Cache Compression** — Full-attention layers use Quantized Johnson-Lindenstrauss projection to compress K vectors to 1-bit (32x reduction), enabling long-context inference within the 48GB memory budget.
+7. **TurboQuant KV Cache Compression** — Full-attention layers use TurboQuant ([Zandieh et al., 2025](https://arxiv.org/abs/2504.19874)) to compress K vectors: Hadamard rotation smooths coordinates, then a Lloyd-Max MSE quantizer captures magnitude (b-1 bits), and QJL sign projection encodes the residual (1 bit). At 3 bits/channel (`--tq 3`), achieves 10.4x K compression with effectively zero attention KL divergence. Supersedes the legacy `--qjl` 1-bit mode.
 
 8. **Trust the OS** — No custom expert cache. The OS page cache (~35GB) manages expert data caching via standard LRU. Every custom caching approach we tested (Metal LRU, malloc cache, LZ4 compressed cache) was slower due to GPU memory pressure or overhead. The page cache achieves ~71% hit rate naturally.
 
@@ -87,7 +97,10 @@ make
 # 2-bit inference (faster but breaks tool calling)
 ./infer --prompt "Explain quantum computing" --tokens 100 --2bit
 
-# QJL 1-bit KV cache compression
+# TurboQuant KV cache compression (recommended for long context)
+./infer --tq 3 --prompt "Explain quantum computing" --tokens 100
+
+# QJL 1-bit KV cache compression (legacy, use --tq instead)
 ./infer --qjl --prompt "Explain quantum computing" --tokens 100
 
 # Interactive chat with tool calling
@@ -125,6 +138,10 @@ metal_infer/
 
 repack_experts.py              # 4-bit expert packing from safetensors
 repack_experts_hadamard.py     # Hadamard rotation + group_size=256 repacking
+experiments/
+  codebook.py                  # Lloyd-Max codebook precomputation for TurboQuant
+  turboquant_test.py           # TurboQuant quality benchmark (float32/QJL/TQ comparison)
+  program.md                   # Autoresearch agent instructions
 progress.py                    # Results visualization (Q2/Q4 tracks)
 results.tsv                    # Experiment log (58 experiments)
 paper/                         # LaTeX source + PDF of the paper
@@ -137,7 +154,8 @@ paper/                         # LaTeX source + PDF of the paper
 |----------|--------|--------|
 | FMA dequant kernel | GPU compute -12% | **+12% tok/s** |
 | Hadamard g256 | Expert size -8.3% | **-12.8GB total, faster I/O** |
-| QJL 1-bit KV cache | 32x K compression | **Long context** |
+| TurboQuant KV cache | 10.4x K, quality-neutral | **Long context, replaces QJL** |
+| QJL 1-bit KV cache | 32x K compression | **Long context (legacy)** |
 | Trust OS page cache | Deleted Metal LRU → +38% | **Foundational** |
 | GPU combine+norm in CMD3 | Eliminates CPU round-trip | **Pipeline** |
 | BLAS delta-net (Accelerate) | cpu_attn 0.78→0.28ms | **+64% attn** |
