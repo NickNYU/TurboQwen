@@ -257,6 +257,7 @@ kernel void dequant_matvec_4bit_v3(
     constant uint&         out_dim    [[buffer(5)]],
     constant uint&         in_dim     [[buffer(6)]],
     constant uint&         group_size [[buffer(7)]],
+    constant uint&         apply_hadamard [[buffer(8)]],
     uint tgid   [[threadgroup_position_in_grid]],     // which tile of rows
     uint lid    [[thread_position_in_threadgroup]],    // 0..255
     uint simd_lane  [[thread_index_in_simdgroup]],    // 0..31
@@ -281,6 +282,26 @@ kernel void dequant_matvec_4bit_v3(
         x_shared[i] = x[i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Optional Hadamard transform on cached input vector ----
+    // For g256 experts: weights were rotated by W @ H during repacking,
+    // so we compute W_rot @ x = W @ (H @ x) by transforming x in-place.
+    // Butterfly-based Walsh-Hadamard: O(n log n), ~10 barriers for dim=2048.
+    if (apply_hadamard) {
+        for (uint stride = 1; stride < in_dim; stride <<= 1) {
+            for (uint i = lid; i < in_dim / 2; i += 256) {
+                uint lo = (i / stride) * (stride * 2) + (i % stride);
+                uint hi = lo + stride;
+                float a = x_shared[lo], b = x_shared[hi];
+                x_shared[lo] = a + b;
+                x_shared[hi] = a - b;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float norm = 1.0f / sqrt(float(in_dim));
+        for (uint i = lid; i < in_dim; i += 256) x_shared[i] *= norm;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 
     // Now safe to bail out for out-of-bounds rows
     if (row >= out_dim) return;
