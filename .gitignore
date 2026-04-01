@@ -6,12 +6,16 @@ metal_infer/bench_pread
 *.o
 *.air
 *.metallib
+*.dSYM/
 
-# Generated model files (recreate with scripts — see CLAUDE.md Quick Start)
+# Model weights (too large for git — download separately)
+model/
+metal_infer/model
 metal_infer/model_weights.bin
 metal_infer/model_weights.json
 metal_infer/vocab.bin
 metal_infer/tokenizer.bin
+expert_index.json
 
 # Python
 __pycache__/
@@ -35,3 +39,12 @@ logs/
 metal_infer/test_lzfse
 metal_infer/repack_experts_lz4
 metal_infer/routing_data.bin
+
+# IDE
+.vscode/
+.idea/
+
+# Session state
+.omc/
+.claude/
+.planning/

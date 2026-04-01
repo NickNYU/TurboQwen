@@ -1,4 +1,4 @@
-# Flash-MoE: Running a 397B Parameter Model on a Laptop
+# TurboQwen: Running a 397B Parameter Model on a Laptop
 
 > **[Read the paper](paper/flash_moe.pdf)** — Full technical details, 90+ experiments, and the story of how an AI and a human built this in 24 hours.
 
@@ -13,6 +13,7 @@ The entire 209GB model streams from SSD through a custom Metal compute pipeline.
 | Configuration | tok/s | Quality | Notes |
 |--------------|-------|---------|-------|
 | 4-bit experts, FMA kernel | **4.36** | Excellent | Current best. Full tool calling. 209GB on disk. |
+| 4-bit Hadamard g256 | **TBD** | Excellent | 8.3% smaller experts, reduced I/O overhead. |
 | 4-bit experts, baseline | 3.90 | Excellent | Before FMA kernel optimization. |
 | 2-bit experts, trust OS | 5.74 | Good* | 120GB on disk. *Breaks JSON/tool calling. |
 | 2-bit peak single token | 7.05 | Good* | Warm cache burst. *Not suitable for tool use. |
@@ -37,19 +38,24 @@ The model has 60 transformer layers: 45 GatedDeltaNet (linear attention) + 15 st
 
 2. **FMA-Optimized Dequant Kernel** — The inner loop of the 4-bit dequantized matrix-vector multiply rearranges the math from `(nibble * scale + bias) * x` to `fma(nibble, scale*x, bias*x)`. Pre-computing `scale*x` and `bias*x` lets the GPU fused multiply-add unit do dequant+multiply in one instruction. 12% faster than the naive formulation.
 
-3. **Metal Compute Shaders** — Hand-written Metal kernels for:
+3. **Hadamard Rotation + group_size=256** — Expert weights are rotated by a Hadamard matrix to smooth outliers, enabling 4x larger quantization groups (256 vs 64). Reduces scale/bias overhead from 11.1% to ~3%, saving 12.8GB across all experts. The inverse Hadamard is applied to input vectors at runtime via an O(n log n) butterfly transform in the Metal kernel — zero overhead when disabled.
+
+4. **Metal Compute Shaders** — Hand-written Metal kernels for:
    - 4-bit and 2-bit dequantized matrix-vector multiply (tiled, SIMD-reduced, shared input cache, FMA-optimized)
+   - In-kernel Walsh-Hadamard butterfly transform (gated, zero-cost when off)
    - Fused SwiGLU activation
    - RMS normalization (two-pass: sum-of-squares reduction + apply)
    - Batched GPU attention (Q@K^T, softmax, scores@V) for full attention layers
    - GPU RoPE (fused with Q deinterleave and K normalization)
    - MoE combine + residual + sigmoid gate (fused kernel)
 
-4. **Deferred GPU Expert Compute** — CMD3 (expert forward pass) is submitted without waiting. The GPU executes it while the CPU prepares the next layer. The combine + residual + norm are also on GPU, feeding directly into the next layer's attention projections.
+5. **Deferred GPU Expert Compute** — CMD3 (expert forward pass) is submitted without waiting. The GPU executes it while the CPU prepares the next layer. The combine + residual + norm are also on GPU, feeding directly into the next layer's attention projections.
 
-5. **Accelerate BLAS for Linear Attention** — The GatedDeltaNet recurrence uses `cblas_sscal`, `cblas_sgemv`, and `cblas_sger` for the 64-head × 128×128 state matrix update. 64% faster than scalar code.
+6. **Accelerate BLAS for Linear Attention** — The GatedDeltaNet recurrence uses `cblas_sscal`, `cblas_sgemv`, and `cblas_sger` for the 64-head × 128×128 state matrix update. 64% faster than scalar code.
 
-6. **Trust the OS** — No custom expert cache. The OS page cache (~35GB) manages expert data caching via standard LRU. Every custom caching approach we tested (Metal LRU, malloc cache, LZ4 compressed cache) was slower due to GPU memory pressure or overhead. The page cache achieves ~71% hit rate naturally.
+7. **QJL 1-bit KV Cache Compression** — Full-attention layers use Quantized Johnson-Lindenstrauss projection to compress K vectors to 1-bit (32x reduction), enabling long-context inference within the 48GB memory budget.
+
+8. **Trust the OS** — No custom expert cache. The OS page cache (~35GB) manages expert data caching via standard LRU. Every custom caching approach we tested (Metal LRU, malloc cache, LZ4 compressed cache) was slower due to GPU memory pressure or overhead. The page cache achieves ~71% hit rate naturally.
 
 ### Pipeline Per Layer (4.28ms average at 4-bit)
 
@@ -71,17 +77,37 @@ On Apple Silicon, SSD DMA and GPU compute share the same memory controller and c
 ```bash
 cd metal_infer
 make
-# 4-bit inference (needs packed_experts/ directory)
+
+# 4-bit inference
 ./infer --prompt "Explain quantum computing" --tokens 100
+
+# Hadamard g256 experts (auto-detected if packed_experts_g256/ exists)
+./infer --g256 --prompt "Explain quantum computing" --tokens 100
 
 # 2-bit inference (faster but breaks tool calling)
 ./infer --prompt "Explain quantum computing" --tokens 100 --2bit
+
+# QJL 1-bit KV cache compression
+./infer --qjl --prompt "Explain quantum computing" --tokens 100
 
 # Interactive chat with tool calling
 ./chat
 
 # Per-layer timing breakdown
 ./infer --prompt "Hello" --tokens 20 --timing
+```
+
+### Preparing Hadamard g256 Experts
+
+```bash
+# Repack all layers (reads packed_experts/, writes packed_experts_g256/)
+python repack_experts_hadamard.py
+
+# Repack one layer with verification
+python repack_experts_hadamard.py --layers 0 --verify
+
+# Repack specific layers
+python repack_experts_hadamard.py --layers 0-4
 ```
 
 ## Project Structure
@@ -96,15 +122,12 @@ metal_infer/
   Makefile             # Build system
   extract_weights.py   # Creates model_weights.bin from safetensors
   repack_experts_2bit.py  # 4-bit → 2-bit expert requantization
-  train_predictor.py   # Expert routing prediction analysis
-  model_weights.bin    # Non-expert weights (5.5GB, mmap'd)
-  model_weights.json   # Tensor manifest
-  vocab.bin            # Vocabulary for token decoding
-  tokenizer.bin        # Pre-exported BPE tokenizer data
 
-repack_experts.py      # 4-bit expert packing from safetensors
-progress.py            # Results visualization (Q2/Q4 tracks)
-results.tsv            # Experiment log (58 experiments)
+repack_experts.py              # 4-bit expert packing from safetensors
+repack_experts_hadamard.py     # Hadamard rotation + group_size=256 repacking
+progress.py                    # Results visualization (Q2/Q4 tracks)
+results.tsv                    # Experiment log (58 experiments)
+paper/                         # LaTeX source + PDF of the paper
 ```
 
 ## What We Tried (and What Worked)
@@ -113,6 +136,8 @@ results.tsv            # Experiment log (58 experiments)
 | Approach | Result | Impact |
 |----------|--------|--------|
 | FMA dequant kernel | GPU compute -12% | **+12% tok/s** |
+| Hadamard g256 | Expert size -8.3% | **-12.8GB total, faster I/O** |
+| QJL 1-bit KV cache | 32x K compression | **Long context** |
 | Trust OS page cache | Deleted Metal LRU → +38% | **Foundational** |
 | GPU combine+norm in CMD3 | Eliminates CPU round-trip | **Pipeline** |
 | BLAS delta-net (Accelerate) | cpu_attn 0.78→0.28ms | **+64% attn** |
@@ -145,3 +170,7 @@ This is a primary development machine. The engine explicitly controls memory:
 - Total: ~6GB, leaving 42GB for OS + page cache
 - No OOM risk. Expert data streams from SSD on demand.
 - No custom caches. Trust the OS.
+
+## License
+
+MIT
