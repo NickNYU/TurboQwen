@@ -26,11 +26,11 @@ The entire 209GB model streams from SSD through a custom Metal compute pipeline.
 
 | KV Config | tok/s | Compression | Quality | Notes |
 |-----------|-------|-------------|---------|-------|
-| float32 (default) | **12.27** | 1x | Baseline | Full precision K+V cache |
-| TurboQuant 2-bit (`--tq 2`) | **11.57** | 15.5x | Near-perfect | 1-bit MSE + 1-bit QJL residual |
-| TurboQuant 3-bit (`--tq 3`) | **10.34** | 10.4x | Quality-neutral | 2-bit MSE + 1-bit QJL residual. **Recommended.** |
-| TurboQuant 4-bit (`--tq 4`) | **11.32** | 7.9x | Quality-neutral | 3-bit MSE + 1-bit QJL residual |
-| QJL 1-bit (`--qjl`) | **11.28** | 32x | Good | Legacy. TQ-2 is faster with better quality. |
+| float32 (default) | **8.50** | 1x | Baseline | Full precision K+V cache |
+| TurboQuant 3-bit (`--tq 3`) | **8.50** | 10.4x | Quality-neutral | 2-bit MSE + 1-bit QJL residual. **Recommended.** |
+| TurboQuant 4-bit (`--tq 4`) | **8.26** | 7.9x | Quality-neutral | 3-bit MSE + 1-bit QJL residual |
+| QJL 1-bit (`--qjl`) | **8.35** | 32x | Good | Legacy. TQ-2 is better quality. |
+| TurboQuant 2-bit (`--tq 2`) | **8.23** | 15.5x | Near-perfect | 1-bit MSE + 1-bit QJL residual |
 
 *TurboQuant ([Zandieh et al., 2025](https://arxiv.org/abs/2504.19874)): Hadamard rotation + Lloyd-Max MSE quantizer + QJL residual correction. At 3 bits/channel, attention KL divergence is effectively zero.*
 
