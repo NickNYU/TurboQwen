@@ -4876,7 +4876,7 @@ static void fused_layer_forward(
                 int mse_bits = g_tq_bits - 1;
                 int indices_per_u32 = 32 / mse_bits;
                 const float *cb = tq_codebook();
-                float sqrt_pi_2 = sqrtf((float)M_PI / 2.0f);
+                float tq_qjl_scale = 0.5f;  // shrinkage factor (autoresearch: 35% better than sqrt(pi/2))
                 for (int h = 0; h < NUM_ATTN_HEADS; h++) {
                     int kv_h = h / heads_per_kv;
                     float q_rot[HEAD_DIM];
@@ -4902,7 +4902,7 @@ static void fused_layer_forward(
                         for (int i = 0; i < QJL_PACKED_PER_HEAD; i++)
                             hamming += __builtin_popcount(q_proj[i] ^ qjl_data[i]);
                         float r_norm = f16_to_f32_bits(kv->tq_norm_cache[p * NUM_KV_HEADS + kv_h]);
-                        float qjl_score = sqrt_pi_2 * r_norm * (float)(HEAD_DIM - 2 * hamming) / (float)HEAD_DIM;
+                        float qjl_score = tq_qjl_scale * r_norm * (float)(HEAD_DIM - 2 * hamming) / (float)HEAD_DIM;
                         scores[p] = (mse_score + qjl_score) * scale;
                     }
                     cpu_softmax(scores, kv->len);

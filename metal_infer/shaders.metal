@@ -959,7 +959,7 @@ kernel void qjl_attn_scores_batched(
 
 // ============================================================================
 // TurboQuant attention scores: MSE codebook lookup + QJL residual correction
-// Computes: score = (dot(q_rot, codebook[mse_idx]) + sqrt(pi/2) * ||r|| * qjl_approx) * scale
+// Computes: score = (dot(q_rot, codebook[mse_idx]) + 0.5 * ||r|| * qjl_approx) * scale
 // ============================================================================
 
 kernel void tq_attn_scores_batched(
@@ -1034,7 +1034,7 @@ kernel void tq_attn_scores_batched(
     if (lid == 0) {
         uint num_kv_heads = kv_qjl_stride / 8;
         float r_norm_f = float(residual_norms[pos * num_kv_heads + kv_h]);
-        float qjl_score = 1.2533141f * r_norm_f * (float(head_dim) - 2.0f * total_hamming) / float(head_dim);
+        float qjl_score = 0.5f * r_norm_f * (float(head_dim) - 2.0f * total_hamming) / float(head_dim);
         scores[h * seq_stride + pos] = (mse_total + qjl_score) * scale;
     }
 }

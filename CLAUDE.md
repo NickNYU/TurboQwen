@@ -10,6 +10,8 @@ The entire 209GB model streams from SSD through a custom Metal compute pipeline.
 
 ![Progress](progress.png)
 
+**Expert quantization** (M3 Max 48GB, Qwen3.5-397B-A17B):
+
 | Configuration | tok/s | Quality | Notes |
 |--------------|-------|---------|-------|
 | 4-bit experts, FMA kernel | **4.36** | Excellent | Current best. Full tool calling. 209GB on disk. |
@@ -17,6 +19,8 @@ The entire 209GB model streams from SSD through a custom Metal compute pipeline.
 | 4-bit experts, baseline | 3.90 | Excellent | Before FMA kernel optimization. |
 | 2-bit experts, trust OS | 5.74 | Good* | 120GB on disk. *Breaks JSON/tool calling. |
 | 2-bit peak single token | 7.05 | Good* | Warm cache burst. *Not suitable for tool use. |
+
+*2-bit quantization produces `\name\` instead of `"name"` in JSON output, making tool calling unreliable. 4-bit is the production configuration.
 
 **KV cache compression** (M1 Max 32GB, Qwen3.5-35B-A3B, 100 tokens):
 
@@ -26,9 +30,9 @@ The entire 209GB model streams from SSD through a custom Metal compute pipeline.
 | TurboQuant 2-bit (`--tq 2`) | **11.57** | 15.5x | Near-perfect | 1-bit MSE + 1-bit QJL residual |
 | TurboQuant 3-bit (`--tq 3`) | **10.34** | 10.4x | Quality-neutral | 2-bit MSE + 1-bit QJL residual. **Recommended.** |
 | TurboQuant 4-bit (`--tq 4`) | **11.32** | 7.9x | Quality-neutral | 3-bit MSE + 1-bit QJL residual |
-| QJL 1-bit (`--qjl`) | **11.28** | 32x | Good | Legacy. TQ-2 is faster and better quality. |
+| QJL 1-bit (`--qjl`) | **11.28** | 32x | Good | Legacy. TQ-2 is faster with better quality. |
 
-*TurboQuant implements [Zandieh et al., 2025]: Hadamard rotation + Lloyd-Max MSE quantizer + QJL residual correction. At 3 bits/channel, attention KL divergence is effectively zero.*
+*TurboQuant ([Zandieh et al., 2025](https://arxiv.org/abs/2504.19874)): Hadamard rotation + Lloyd-Max MSE quantizer + QJL residual correction. At 3 bits/channel, attention KL divergence is effectively zero.*
 
 ## Hardware
 
