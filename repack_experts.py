@@ -2,8 +2,9 @@
 """Repack expert weights from scattered safetensors into contiguous per-layer binary files.
 
 Creates one binary file per layer: packed_experts/layer_XX.bin
-Each file = 512 experts x 7,077,888 bytes = ~3.63 GB
-Expert E starts at byte offset E * 7,077,888
+Each file = NUM_EXPERTS experts x EXPERT_SIZE bytes
+
+Expert E starts at byte offset E * EXPERT_SIZE
 
 Within each expert block, 9 components packed in fixed order:
   gate_proj.weight, gate_proj.scales, gate_proj.biases,
@@ -11,11 +12,12 @@ Within each expert block, 9 components packed in fixed order:
   down_proj.weight,  down_proj.scales,  down_proj.biases
 
 Usage:
-    python repack_experts.py                    # repack all 60 layers
-    python repack_experts.py --layers 0-4       # repack layers 0-4
-    python repack_experts.py --layers 0,5,10    # repack specific layers
-    python repack_experts.py --dry-run           # verify without writing
-    python repack_experts.py --verify-only 0     # verify layer 0 against originals
+    python repack_experts.py                        # repack all layers (35B default)
+    python repack_experts.py --model 397B           # repack 397B model
+    python repack_experts.py --layers 0-4           # repack layers 0-4
+    python repack_experts.py --layers 0,5,10        # repack specific layers
+    python repack_experts.py --dry-run              # verify without writing
+    python repack_experts.py --verify-only 0        # verify layer 0 against originals
 """
 
 import argparse
@@ -24,29 +26,77 @@ import os
 import time
 import sys
 
-# Component order and expected sizes
-COMPONENTS = [
-    {"name": "gate_proj.weight",  "offset": 0,       "size": 2097152, "dtype": "U32", "shape": [1024, 512]},
-    {"name": "gate_proj.scales",  "offset": 2097152,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "gate_proj.biases",  "offset": 2228224,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "up_proj.weight",    "offset": 2359296,  "size": 2097152, "dtype": "U32", "shape": [1024, 512]},
-    {"name": "up_proj.scales",    "offset": 4456448,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "up_proj.biases",    "offset": 4587520,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "down_proj.weight",  "offset": 4718592,  "size": 2097152, "dtype": "U32", "shape": [4096, 128]},
-    {"name": "down_proj.scales",  "offset": 6815744,  "size": 131072,  "dtype": "BF16", "shape": [4096, 16]},
-    {"name": "down_proj.biases",  "offset": 6946816,  "size": 131072,  "dtype": "BF16", "shape": [4096, 16]},
-]
 
-EXPERT_SIZE = 7077888   # bytes per expert
-NUM_EXPERTS = 512
-NUM_LAYERS = 60
-LAYER_SIZE = NUM_EXPERTS * EXPERT_SIZE  # 3,623,878,656 bytes (~3.63 GB)
+# ── Model configurations ─────────────────────────────────────────────────────
+
+def get_model_config(model):
+    """Return config dict for the given model ('35B' or '397B')."""
+    if model == '35B':
+        components = [
+            {"name": "gate_proj.weight",  "offset": 0,        "size": 524288,  "dtype": "U32",  "shape": [512, 256]},
+            {"name": "gate_proj.scales",  "offset": 524288,   "size": 32768,   "dtype": "BF16", "shape": [512, 32]},
+            {"name": "gate_proj.biases",  "offset": 557056,   "size": 32768,   "dtype": "BF16", "shape": [512, 32]},
+            {"name": "up_proj.weight",    "offset": 589824,   "size": 524288,  "dtype": "U32",  "shape": [512, 256]},
+            {"name": "up_proj.scales",    "offset": 1114112,  "size": 32768,   "dtype": "BF16", "shape": [512, 32]},
+            {"name": "up_proj.biases",    "offset": 1146880,  "size": 32768,   "dtype": "BF16", "shape": [512, 32]},
+            {"name": "down_proj.weight",  "offset": 1179648,  "size": 524288,  "dtype": "U32",  "shape": [2048, 64]},
+            {"name": "down_proj.scales",  "offset": 1703936,  "size": 32768,   "dtype": "BF16", "shape": [2048, 8]},
+            {"name": "down_proj.biases",  "offset": 1736704,  "size": 32768,   "dtype": "BF16", "shape": [2048, 8]},
+        ]
+        return {
+            "components":   components,
+            "expert_size":  1769472,
+            "num_experts":  256,
+            "num_layers":   40,
+        }
+    elif model == '397B':
+        components = [
+            {"name": "gate_proj.weight",  "offset": 0,         "size": 2097152,  "dtype": "U32",  "shape": [1024, 512]},
+            {"name": "gate_proj.scales",  "offset": 2097152,   "size": 131072,   "dtype": "BF16", "shape": [1024, 64]},
+            {"name": "gate_proj.biases",  "offset": 2228224,   "size": 131072,   "dtype": "BF16", "shape": [1024, 64]},
+            {"name": "up_proj.weight",    "offset": 2359296,   "size": 2097152,  "dtype": "U32",  "shape": [1024, 512]},
+            {"name": "up_proj.scales",    "offset": 4456448,   "size": 131072,   "dtype": "BF16", "shape": [1024, 64]},
+            {"name": "up_proj.biases",    "offset": 4587520,   "size": 131072,   "dtype": "BF16", "shape": [1024, 64]},
+            {"name": "down_proj.weight",  "offset": 4718592,   "size": 2097152,  "dtype": "U32",  "shape": [4096, 128]},
+            {"name": "down_proj.scales",  "offset": 6815744,   "size": 131072,   "dtype": "BF16", "shape": [4096, 16]},
+            {"name": "down_proj.biases",  "offset": 6946816,   "size": 131072,   "dtype": "BF16", "shape": [4096, 16]},
+        ]
+        return {
+            "components":   components,
+            "expert_size":  7077888,
+            "num_experts":  512,
+            "num_layers":   60,
+        }
+    else:
+        raise ValueError(f"Unknown model: {model!r}. Choose '35B' or '397B'.")
 
 
-def parse_layers(spec):
+def autodetect_model(output_dir):
+    """Infer model from the size of an existing packed layer file.
+
+    Returns '35B', '397B', or None if detection is not possible.
+    """
+    cfg_35b  = get_model_config('35B')
+    cfg_397b = get_model_config('397B')
+    layer_size_35b  = cfg_35b['num_experts']  * cfg_35b['expert_size']
+    layer_size_397b = cfg_397b['num_experts'] * cfg_397b['expert_size']
+
+    for fname in sorted(os.listdir(output_dir)):
+        if fname.startswith('layer_') and fname.endswith('.bin'):
+            size = os.path.getsize(os.path.join(output_dir, fname))
+            if size == layer_size_35b:
+                return '35B'
+            if size == layer_size_397b:
+                return '397B'
+    return None
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def parse_layers(spec, num_layers):
     """Parse layer specification like '0-4' or '0,5,10' or 'all'."""
     if spec is None or spec == 'all':
-        return list(range(NUM_LAYERS))
+        return list(range(num_layers))
     layers = []
     for part in spec.split(','):
         part = part.strip()
@@ -65,9 +115,9 @@ def load_index(index_path):
     return idx['expert_reads'], idx['model_path']
 
 
-def verify_component_sizes(expert_reads):
+def verify_component_sizes(expert_reads, components):
     """Verify that component sizes in the index match expected sizes."""
-    expected = {c['name']: c['size'] for c in COMPONENTS}
+    expected = {c['name']: c['size'] for c in components}
     for layer_key, comps in expert_reads.items():
         for comp_name, info in comps.items():
             if comp_name not in expected:
@@ -100,8 +150,9 @@ def open_source_files(expert_reads, model_path, layers):
     return fds
 
 
-def repack_layer(layer_idx, expert_reads, model_path, fds, output_dir, dry_run=False):
-    """Repack all 512 experts for one layer into a contiguous binary file.
+def repack_layer(layer_idx, expert_reads, model_path, fds, output_dir,
+                 components, expert_size, num_experts, layer_size, dry_run=False):
+    """Repack all experts for one layer into a contiguous binary file.
 
     Returns (bytes_written, elapsed_seconds).
     """
@@ -114,38 +165,32 @@ def repack_layer(layer_idx, expert_reads, model_path, fds, output_dir, dry_run=F
     out_path = os.path.join(output_dir, f"layer_{layer_idx:02d}.bin")
 
     if dry_run:
-        # Just verify we can compute all offsets
-        for expert_idx in range(NUM_EXPERTS):
-            for comp in COMPONENTS:
+        for expert_idx in range(num_experts):
+            for comp in components:
                 info = layer_info[comp['name']]
                 src_offset = info['abs_offset'] + expert_idx * info['expert_stride']
-                dst_offset = expert_idx * EXPERT_SIZE + comp['offset']
-        print(f"  Layer {layer_idx:2d}: DRY RUN OK — would write {LAYER_SIZE:,} bytes to {out_path}")
-        return LAYER_SIZE, 0.0
+                dst_offset = expert_idx * expert_size + comp['offset']
+        print(f"  Layer {layer_idx:2d}: DRY RUN OK — would write {layer_size:,} bytes to {out_path}")
+        return layer_size, 0.0
 
     t0 = time.monotonic()
 
-    # Pre-allocate output file with zeros
     fd_out = os.open(out_path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
-    os.ftruncate(fd_out, LAYER_SIZE)
+    os.ftruncate(fd_out, layer_size)
 
     bytes_written = 0
 
-    # Build read plan: group reads by source file for better locality
-    # Each entry: (src_fd, src_offset, dst_offset, size)
     read_plan = []
-    for expert_idx in range(NUM_EXPERTS):
-        for comp in COMPONENTS:
+    for expert_idx in range(num_experts):
+        for comp in components:
             info = layer_info[comp['name']]
             src_fd = fds[info['file']]
             src_offset = info['abs_offset'] + expert_idx * info['expert_stride']
-            dst_offset = expert_idx * EXPERT_SIZE + comp['offset']
+            dst_offset = expert_idx * expert_size + comp['offset']
             read_plan.append((src_fd, src_offset, dst_offset, comp['size']))
 
-    # Sort by (src_fd, src_offset) for sequential read locality
     read_plan.sort(key=lambda x: (x[0], x[1]))
 
-    # Execute reads and writes
     for src_fd, src_offset, dst_offset, size in read_plan:
         data = os.pread(src_fd, size, src_offset)
         if len(data) != size:
@@ -160,8 +205,9 @@ def repack_layer(layer_idx, expert_reads, model_path, fds, output_dir, dry_run=F
     return bytes_written, elapsed
 
 
-def verify_layer(layer_idx, expert_reads, model_path, fds, output_dir):
-    """Read back expert 0 from packed file and compare to originals."""
+def verify_layer(layer_idx, expert_reads, model_path, fds, output_dir,
+                 components, expert_size, num_experts):
+    """Read back spot-check experts from packed file and compare to originals."""
     layer_key = str(layer_idx)
     layer_info = expert_reads[layer_key]
     out_path = os.path.join(output_dir, f"layer_{layer_idx:02d}.bin")
@@ -172,16 +218,18 @@ def verify_layer(layer_idx, expert_reads, model_path, fds, output_dir):
 
     fd_packed = os.open(out_path, os.O_RDONLY)
 
+    # Spot-check: first two, middle, last
+    spot = sorted({0, 1, num_experts // 2, num_experts - 1})
     mismatches = 0
-    for expert_idx in [0, 1, 255, 511]:  # spot check several experts
-        for comp in COMPONENTS:
+    for expert_idx in spot:
+        for comp in components:
             info = layer_info[comp['name']]
             src_fd = fds[info['file']]
             src_offset = info['abs_offset'] + expert_idx * info['expert_stride']
-            dst_offset = expert_idx * EXPERT_SIZE + comp['offset']
+            dst_offset = expert_idx * expert_size + comp['offset']
 
             original = os.pread(src_fd, comp['size'], src_offset)
-            packed = os.pread(fd_packed, comp['size'], dst_offset)
+            packed   = os.pread(fd_packed, comp['size'], dst_offset)
 
             if original != packed:
                 print(f"  MISMATCH: layer {layer_idx}, expert {expert_idx}, {comp['name']}")
@@ -189,21 +237,22 @@ def verify_layer(layer_idx, expert_reads, model_path, fds, output_dir):
 
     os.close(fd_packed)
 
+    spot_str = ', '.join(str(e) for e in spot)
     if mismatches == 0:
-        print(f"  Layer {layer_idx}: verification PASSED (experts 0, 1, 255, 511)")
+        print(f"  Layer {layer_idx}: verification PASSED (experts {spot_str})")
     else:
         print(f"  Layer {layer_idx}: verification FAILED ({mismatches} mismatches)")
 
     return mismatches == 0
 
 
-def write_layout(output_dir):
+def write_layout(output_dir, expert_size, num_layers, num_experts, components):
     """Write layout.json describing the packed format."""
     layout = {
-        "expert_size": EXPERT_SIZE,
-        "num_layers": NUM_LAYERS,
-        "num_experts": NUM_EXPERTS,
-        "components": COMPONENTS,
+        "expert_size":  expert_size,
+        "num_layers":   num_layers,
+        "num_experts":  num_experts,
+        "components":   components,
     }
     path = os.path.join(output_dir, "layout.json")
     with open(path, 'w') as f:
@@ -211,9 +260,13 @@ def write_layout(output_dir):
     print(f"Wrote {path}")
 
 
+# ── Main ──────────────────────────────────────────────────────────────────────
+
 def main():
     parser = argparse.ArgumentParser(description="Repack expert weights into contiguous per-layer binary files")
-    parser.add_argument('--index', default='/Users/danielwoods/Workspace/ane-research/expert_index.json',
+    parser.add_argument('--model', default=None, choices=['35B', '397B'],
+                        help='Model size (default: auto-detect from existing files, else 35B)')
+    parser.add_argument('--index', default='./expert_index.json',
                         help='Path to expert_index.json')
     parser.add_argument('--layers', default=None,
                         help='Layer spec: "all", "0-4", "0,5,10" (default: all)')
@@ -228,8 +281,36 @@ def main():
     print(f"Model path: {model_path}")
     print(f"Layers in index: {len(expert_reads)}")
 
+    # Resolve model: explicit flag > auto-detect > default
+    model = args.model
+    if model is None:
+        output_dir_probe = os.path.join(model_path, "packed_experts")
+        if os.path.isdir(output_dir_probe):
+            detected = autodetect_model(output_dir_probe)
+            if detected:
+                model = detected
+                print(f"Auto-detected model: {model} (from existing packed files)")
+    if model is None:
+        model = '35B'
+        print(f"Using default model: {model}")
+    else:
+        if args.model is None:
+            pass  # already printed above
+        else:
+            print(f"Model: {model}")
+
+    cfg = get_model_config(model)
+    COMPONENTS  = cfg['components']
+    EXPERT_SIZE = cfg['expert_size']
+    NUM_EXPERTS = cfg['num_experts']
+    NUM_LAYERS  = cfg['num_layers']
+    LAYER_SIZE  = NUM_EXPERTS * EXPERT_SIZE
+
+    print(f"Config: {NUM_LAYERS} layers, {NUM_EXPERTS} experts/layer, "
+          f"{EXPERT_SIZE:,} bytes/expert, {LAYER_SIZE/1024**3:.2f} GB/layer")
+
     # Verify component sizes
-    if not verify_component_sizes(expert_reads):
+    if not verify_component_sizes(expert_reads, COMPONENTS):
         print("ABORTING: component size mismatch")
         sys.exit(1)
 
@@ -241,7 +322,7 @@ def main():
     if args.verify_only is not None:
         layers = [args.verify_only]
     else:
-        layers = parse_layers(args.layers)
+        layers = parse_layers(args.layers, NUM_LAYERS)
 
     print(f"Layers to process: {layers[0]}-{layers[-1]} ({len(layers)} layers)")
 
@@ -249,37 +330,37 @@ def main():
         total_bytes = len(layers) * LAYER_SIZE
         print(f"Total data to write: {total_bytes / (1024**3):.1f} GB")
 
-        # Check free disk space
         stat = os.statvfs(output_dir)
         free_bytes = stat.f_bavail * stat.f_frsize
         free_gb = free_bytes / (1024**3)
         needed_gb = total_bytes / (1024**3)
         print(f"Free disk space: {free_gb:.1f} GB, needed: {needed_gb:.1f} GB")
         if free_bytes < total_bytes:
+            layer_gb = LAYER_SIZE / (1024**3)
+            hint_max = int(free_gb / layer_gb) - 1
             print(f"WARNING: Not enough free space! Need {needed_gb:.1f} GB but only {free_gb:.1f} GB free.")
-            print(f"Hint: use --layers to process a subset, e.g. --layers 0-{int(free_gb / 3.63) - 1}")
+            print(f"Hint: use --layers to process a subset, e.g. --layers 0-{hint_max}")
             sys.exit(1)
 
-    # Open source files
     fds = open_source_files(expert_reads, model_path, layers)
 
     if args.verify_only is not None:
-        verify_layer(args.verify_only, expert_reads, model_path, fds, output_dir)
+        verify_layer(args.verify_only, expert_reads, model_path, fds, output_dir,
+                     COMPONENTS, EXPERT_SIZE, NUM_EXPERTS)
         for fd in fds.values():
             os.close(fd)
         return
 
-    # Write layout.json
-    write_layout(output_dir)
+    write_layout(output_dir, EXPERT_SIZE, NUM_LAYERS, NUM_EXPERTS, COMPONENTS)
 
-    # Repack each layer
     t_start = time.monotonic()
     total_written = 0
 
     for i, layer_idx in enumerate(layers):
-        t_layer = time.monotonic()
         bytes_written, elapsed = repack_layer(
-            layer_idx, expert_reads, model_path, fds, output_dir, dry_run=args.dry_run
+            layer_idx, expert_reads, model_path, fds, output_dir,
+            COMPONENTS, EXPERT_SIZE, NUM_EXPERTS, LAYER_SIZE,
+            dry_run=args.dry_run,
         )
         total_written += bytes_written
 
@@ -294,16 +375,14 @@ def main():
                   f"({overall_throughput:.1f} GB/s avg) | "
                   f"ETA: {eta:.0f}s")
 
-            # Verify this layer immediately
-            if not verify_layer(layer_idx, expert_reads, model_path, fds, output_dir):
+            if not verify_layer(layer_idx, expert_reads, model_path, fds, output_dir,
+                                 COMPONENTS, EXPERT_SIZE, NUM_EXPERTS):
                 print(f"ABORTING: verification failed for layer {layer_idx}")
                 sys.exit(1)
 
-    # Close source files
     for fd in fds.values():
         os.close(fd)
 
-    # Final summary
     total_elapsed = time.monotonic() - t_start
     if not args.dry_run and total_written > 0:
         print(f"\n{'='*60}")

@@ -346,7 +346,13 @@ def main():
                         help='Verify roundtrip quality after repacking')
     parser.add_argument('--dry-run', action='store_true',
                         help='Check source files exist without writing')
+    parser.add_argument('--model', choices=['35B', '397B'], default='35B',
+                        help='Model variant (default: 35B)')
     args = parser.parse_args()
+
+    if args.model == '397B':
+        print("ERROR: Hadamard g256 repacking is not yet supported for 397B.")
+        sys.exit(1)
 
     input_dir = os.path.join(args.model_path, "packed_experts")
     output_dir = os.path.join(args.model_path, "packed_experts_g256")

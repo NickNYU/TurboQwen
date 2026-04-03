@@ -7,8 +7,8 @@
 #   make bench    — benchmark single expert (10 iterations)
 #   make moe      — full MoE forward pass (K experts, single layer)
 #   make moebench — benchmark MoE (10 iterations)
-#   make full     — full 60-layer MoE forward pass (K=4)
-#   make fullbench — benchmark full 60-layer forward (3 iterations)
+#   make full     — full 40-layer MoE forward pass (K=4)
+#   make fullbench — benchmark full 40-layer forward (3 iterations)
 #   make chat     — build interactive chat TUI
 #   make clean    — remove build artifacts
 #
@@ -19,6 +19,12 @@ CC = clang
 CFLAGS = -O2 -Wall -Wextra -fobjc-arc -DACCELERATE_NEW_LAPACK
 FRAMEWORKS = -framework Metal -framework Foundation -framework Accelerate
 LDFLAGS = -lpthread -lcompression
+
+# Model selection: make MODEL=397B for Qwen3.5-397B-A17B (default: 35B)
+MODEL ?= 35B
+ifeq ($(MODEL),397B)
+  CFLAGS += -DMODEL_397B
+endif
 
 TARGET = metal_infer
 MAIN_SRC = main.m
@@ -56,7 +62,7 @@ $(SHADER_LIB): $(SHADER_AIR)
 	$(METALLIB_TOOL) $(SHADER_AIR) -o $(SHADER_LIB)
 
 # Build the inference engine
-$(INFER_TARGET): $(INFER_SRC)
+$(INFER_TARGET): $(INFER_SRC) model_config.h
 	$(CC) $(CFLAGS) $(FRAMEWORKS) $(LDFLAGS) $(INFER_SRC) -o $(INFER_TARGET)
 
 # Build the chat client (thin HTTP/SSE client + linenoise line editor)

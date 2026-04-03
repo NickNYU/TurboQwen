@@ -65,67 +65,7 @@
 #include <sys/wait.h>
 #include <compression.h>
 
-// ============================================================================
-// Model constants
-// ============================================================================
-
-#define HIDDEN_DIM          2048
-#define NUM_LAYERS          40
-#define NUM_ATTN_HEADS      16
-#define NUM_KV_HEADS        2
-#define HEAD_DIM            256
-#define VOCAB_SIZE          248320
-#define RMS_NORM_EPS        1e-6f
-#define NUM_EXPERTS         256
-#define NUM_EXPERTS_PER_TOK 8
-#define MOE_INTERMEDIATE    512
-#define SHARED_INTERMEDIATE 512
-#define FULL_ATTN_INTERVAL  4
-#define GROUP_SIZE          64
-#define BITS                4
-
-// Linear attention (GatedDeltaNet) constants
-#define LINEAR_NUM_V_HEADS  32
-#define LINEAR_NUM_K_HEADS  16
-#define LINEAR_KEY_DIM      128   // head_k_dim
-#define LINEAR_VALUE_DIM    128   // head_v_dim
-#define LINEAR_TOTAL_KEY    (LINEAR_NUM_K_HEADS * LINEAR_KEY_DIM)   // 2048
-#define LINEAR_TOTAL_VALUE  (LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM) // 4096
-#define LINEAR_CONV_DIM     (LINEAR_TOTAL_KEY * 2 + LINEAR_TOTAL_VALUE) // 8192
-#define CONV_KERNEL_SIZE    4
-
-// Full attention constants
-#define ROPE_THETA          10000000.0f
-#define PARTIAL_ROTARY      0.25f
-#define ROTARY_DIM          (int)(HEAD_DIM * PARTIAL_ROTARY)  // 64
-
-// Expert packed binary layout (from existing code)
-#define EXPERT_SIZE         1769472
-
-// 2-bit expert layout (from repack_experts_2bit.py)
-// Recalculated for 35B: moe_intermediate=512, hidden=2048
-#define EXPERT_SIZE_2BIT    983040
-#define GATE_W_OFF_2  0
-#define GATE_S_OFF_2  262144
-#define GATE_B_OFF_2  294912
-#define UP_W_OFF_2    327680
-#define UP_S_OFF_2    589824
-#define UP_B_OFF_2    622592
-#define DOWN_W_OFF_2  655360
-#define DOWN_S_OFF_2  917504
-#define DOWN_B_OFF_2  950272
-
-// Hadamard g256 expert layout (group_size=256, Hadamard-rotated weights)
-#define EXPERT_SIZE_G256    1622144
-#define GATE_W_OFF_G256     0
-#define GATE_S_OFF_G256     524288
-#define GATE_B_OFF_G256     532480
-#define UP_W_OFF_G256       540672
-#define UP_S_OFF_G256       1064960
-#define UP_B_OFF_G256       1073152
-#define DOWN_W_OFF_G256     1081344
-#define DOWN_S_OFF_G256     1605632
-#define DOWN_B_OFF_G256     1613824
+#include "model_config.h"
 
 // KV cache maximum context length
 #define MAX_SEQ_LEN 1048576  // 1M context — only 15 full-attn layers need KV cache, ~15GB at max
@@ -284,9 +224,9 @@ static inline ExpertOffsets expert_offsets(void) {
         o.up_w   = UP_W_OFF_G256;   o.up_s   = UP_S_OFF_G256;   o.up_b   = UP_B_OFF_G256;
         o.down_w = DOWN_W_OFF_G256; o.down_s = DOWN_S_OFF_G256; o.down_b = DOWN_B_OFF_G256;
     } else {
-        o.gate_w = 0;        o.gate_s = 524288;   o.gate_b = 557056;
-        o.up_w   = 589824;   o.up_s   = 1114112;  o.up_b   = 1146880;
-        o.down_w = 1179648;  o.down_s = 1703936;  o.down_b = 1736704;
+        o.gate_w = GATE_W_OFF; o.gate_s = GATE_S_OFF; o.gate_b = GATE_B_OFF;
+        o.up_w   = UP_W_OFF;   o.up_s   = UP_S_OFF;   o.up_b   = UP_B_OFF;
+        o.down_w = DOWN_W_OFF; o.down_s = DOWN_S_OFF; o.down_b = DOWN_B_OFF;
     }
     return o;
 }
@@ -1044,7 +984,6 @@ typedef struct {
     id<MTLBuffer> buf_h_mid;        // [HIDDEN_DIM floats] residual+oproj result
     id<MTLBuffer> buf_sum_sq;       // [1 float] for RMS norm reduction
     // GPU attention buffers (for full attention layers)
-    #define NUM_FULL_ATTN_LAYERS 10
     id<MTLBuffer> buf_kv_k[NUM_FULL_ATTN_LAYERS];  // K cache per full-attn layer
     id<MTLBuffer> buf_kv_v[NUM_FULL_ATTN_LAYERS];  // V cache per full-attn layer
     id<MTLBuffer> buf_attn_q;       // [NUM_ATTN_HEADS * HEAD_DIM floats] all query heads
@@ -1077,7 +1016,6 @@ typedef struct {
     id<MTLComputePipelineState> compute_decay_beta; // g_decay and beta_gate for delta-net
     id<MTLComputePipelineState> gated_rms_norm;  // z-gated output normalization
     // Persistent GPU state buffers for linear attention layers
-    #define NUM_LINEAR_LAYERS 30
     id<MTLBuffer> buf_delta_state[NUM_LINEAR_LAYERS];   // [64*128*128] float per layer
     id<MTLBuffer> buf_conv_state[NUM_LINEAR_LAYERS];     // [3*12288] float per layer
     // Scratch buffers for delta-net inputs/outputs
